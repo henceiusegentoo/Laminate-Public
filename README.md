@@ -5,6 +5,8 @@ plugins**: standard Bukkit/Paper plugins that can apply
 [SpongePowered Mixin](https://github.com/SpongePowered/Mixin) bytecode transformations to the
 server at runtime.
 
+> Comprehensive docs can be found [here](https://github.com/henceiusegentoo/Laminate-Public/tree/main/docs/adoc) 
+
 ## What makes Laminate special
 
 Laminate lets you write plugins that use mixins for deep, low-level server modifications without
@@ -123,12 +125,3 @@ MinecraftServer server = ((CraftServer) getServer()).getServer();
 MinecraftServerAccessor accessor = MinecraftServerAccessor.of(server);
 accessor.write("Hello World");
 ```
-
-## Further Reading
-
-For detailed documentation see the [Laminate Wiki](https://github.com/henceiusegentoo/Laminate/wiki):
-
-- [Writing a Hybrid Plugin](https://github.com/henceiusegentoo/Laminate/wiki/Writing-a-Hybrid-Plugin): full plugin development guide
-- [Architecture](https://github.com/henceiusegentoo/Laminate/wiki/Architecture): bootstrap sequence, mixin pipeline, and module structure
-- [Building from Source](https://github.com/henceiusegentoo/Laminate/wiki/Building-from-Source): build steps, Gradle tasks, and the test-plugin module
-- [Troubleshooting](https://github.com/henceiusegentoo/Laminate/wiki/Troubleshooting): common errors and fixes
