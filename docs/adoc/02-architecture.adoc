@@ -1,0 +1,117 @@
+// ============================================================
+[[architecture]]
+== 2. Architecture Overview
+// ============================================================
+
+=== 2.1. What Laminate adds
+
+Laminate does not replace Paper's patch stack.
+It layers a narrow, deep capability on top of upstream Paper:
+loading plugins that can transform live server bytecode via
+https://github.com/SpongePowered/Mixin[SpongePowered Mixin].
+
+The central problem is ordering.
+The JVM instrument API (<<transformer,`ClassFileTransformer`>>) must be active before a
+class is first loaded; certain Mixin operations (field addition) cannot be applied
+retroactively.
+Paper's plugin system loads classes far too late.
+Laminate therefore pushes the entire mixin setup to the very beginning of the JVM's life,
+before any Minecraft class is loaded.
+
+=== 2.2. The startup pipeline
+
+The full flow from `java -jar laminate-server.jar` to a running Paper server:
+
+....
+java -jar laminate-server.jar [app-args]
+          |
+          v
++---------------------------+  no agent?
+|  LaminateLauncher.main()  |-----------> relaunch self with:
+|  (Main-Class in manifest) |              --add-opens x4
++---------------------------+              -javaagent:self
+          | agent already loaded           -jar self
+          v
++---------------------------+
+| PaperMixinAgent.premain() |  runs first (before main)
+| (Premain-Class in         |  stores Instrumentation in
+|  manifest)                |  System.getProperties()
++---------------------------+
+          |
+          v
++---------------------------+
+|  LaminateLauncher.main()  |  invokes Bundler-Main-Class:
+|  (second JVM)             |  io.papermc.paperclip.Main
++---------------------------+
+          |  Paperclip sets up classpath
+          v
++---------------------------+
+|  org.bukkit.craftbukkit   |  DedicatedServer startup
+|  .Main -> PaperBootstrap  |
++---------------------------+
+          |
+          v  <-- BEFORE SharedConstants.tryDetectVersion()
++----------------------------------+
+|  LaminateMixinBootstrap          |  1. scan plugin JARs
+|  .bootstrap(pluginDir, ...)      |  2. read hybrid descriptors
+|  [via PaperBootstrap]            |  3. init Mixin + MixinExtras
+|                                  |  4. register mixin configs
+|                                  |  5. advance phases to DEFAULT
+|                                  |  6. install ClassFileTransformer
+|                                  |  7. retransform loaded NMC classes
++----------------------------------+
+          |
+          v
++---------------------------+
+|  SharedConstants           |  Minecraft class loading begins
+|  .tryDetectVersion()       |  (mixin transformer already active)
++---------------------------+
+          |
+          v
++----------------------------------+
+|  PluginInitializerManager.load() |  1. call bootstrap again (idempotent)
+|  [normal Paper plugin init]      |  2. register providers from dirs/flags
+|                                  |  3. remove failed hybrid providers
+|                                  |  4. log Laminate/Paper/Bukkit counts
++----------------------------------+
+          |
+          v
++---------------------------+
+|  Normal Paper server start |
+|  (plugins load, worlds     |
+|   load, etc.)              |
++---------------------------+
+....
+
+=== 2.3. Module map
+
+[cols="1,2,2"]
+|===
+|Module |Purpose |Key new files
+
+|`paper-server`
+|Runtime server; all Laminate integration lives here
+|`LaminateLauncher`, `PaperBootstrap` (modified), `mixin/` subsystem, `plugin/` changes
+
+|`laminate-api`
+|Compile-time processors and runtime bridges for plugin authors
+|`accessor/`, `event/`, `internal/`
+
+|`paper-api`
+|Minimal changes: Laminate branding in `ServerBuildInfo`
+|`ServerBuildInfo.LAMINATE` brand key
+
+|`test-plugin`
+|Reference hybrid plugin demonstrating all tooling
+|`ServerMixin`, `ServerLevelMixin`, `plugin.yml`
+|===
+
+=== 2.4. Key design invariants
+
+* The `ClassFileTransformer` must be installed *before* any `net.minecraft.*` class is
+  loaded. `PaperBootstrap.boot()` calls bootstrap before `SharedConstants.tryDetectVersion()`.
+* Bootstrap is _idempotent_: a second call returns cached results immediately.
+* Failed hybrid plugins are _isolated_: their providers are removed from Paper's provider
+  storage; the rest of the server continues starting.
+* Mixin transformations are _irreversible process state_: hot-reload is blocked whenever
+  any hybrid plugin is active.

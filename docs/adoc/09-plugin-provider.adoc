@@ -1,0 +1,49 @@
+// ============================================================
+[[plugin-provider]]
+== 9. Plugin Provider System
+// ============================================================
+
+=== 9.1. `LaminatePluginProvider`
+
+Class:: `io.papermc.paper.plugin.provider.type.spigot.LaminatePluginProvider`
+Source:: `paper-server/src/main/java/io/papermc/paper/plugin/provider/type/spigot/LaminatePluginProvider.java`
+
+`LaminatePluginProvider` is a _marker subtype_ of `SpigotPluginProvider`.
+All plugin-loading logic is inherited unchanged.
+The distinct type serves three purposes:
+
+. Lets `PaperPluginsCommand` display hybrid plugins in a separate "Laminate Plugins"
+  bucket.
+. Lets `MultiRuntimePluginProviderStorage` and `SingularRuntimePluginProviderStorage`
+  block hot-reload registration for hybrid plugins.
+. Lets `PluginInitializerManager.load()` and `PluginInitializerManager.reload()` log and
+  warn specifically about hybrid plugins.
+
+Constructor is package-private; instances are created only by `SpigotPluginProviderFactory`.
+
+=== 9.2. `SpigotPluginProviderFactory.build`
+
+[source,java]
+----
+public SpigotPluginProvider build(
+    JarFile file,
+    PluginDescriptionFile configuration,
+    Path source
+) throws InvalidDescriptionException
+----
+
+After the standard Spigot provider construction, the factory checks whether the plugin
+name appears in `LaminateMixinBootstrap.getLoadedHybridPluginNames()`:
+
+[source,java]
+----
+if (LaminateMixinBootstrap.getLoadedHybridPluginNames().contains(configuration.getName())) {
+    return new LaminatePluginProvider(source, file, configuration, paperLibraryPaths);
+}
+return new SpigotPluginProvider(source, file, configuration, paperLibraryPaths);
+----
+
+`getLoadedHybridPluginNames()` returns original-case names; `configuration.getName()`
+returns the name as declared in `plugin.yml`.
+The comparison is therefore case-sensitive and requires that the JAR's `plugin.yml` name
+matches exactly what `HybridDescriptorReader` extracted during bootstrap.

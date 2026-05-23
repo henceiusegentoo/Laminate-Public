@@ -1,0 +1,79 @@
+// ============================================================
+[[bootstrap-order]]
+== 5. Bootstrap Coordination
+// ============================================================
+
+=== 5.1. `PaperBootstrap`
+
+Class:: `io.papermc.paper.PaperBootstrap`
+Source:: `paper-server/src/main/java/io/papermc/paper/PaperBootstrap.java`
+
+`PaperBootstrap.boot(OptionSet)` is the Paperclip-delegated entry point.
+The critical ordering is:
+
+[source,java]
+----
+public static void boot(final OptionSet options) {
+    bootstrapHybridMixins(options);          // (1) Laminate — before any Minecraft class
+
+    SharedConstants.tryDetectVersion();      // (2) first Minecraft class load
+    getStartupVersionMessages().forEach(LOGGER::info);
+    Main.main(options);                      // (3) rest of Paper startup
+}
+----
+
+`SharedConstants.tryDetectVersion()` triggers the class loading of core Minecraft classes.
+Any mixin transformation that adds fields to those classes _must_ be applied before this
+line; once a class is loaded, field addition via retransformation is not guaranteed to
+succeed.
+
+`bootstrapHybridMixins(OptionSet)` reads the `--plugins`, `--add-plugin`, and
+`--add-plugin-dir` options from the command-line and delegates to
+`LaminateMixinBootstrap.bootstrap(pluginDir, addFiles, addDirs)`.
+
+=== 5.2. `PluginInitializerManager`
+
+Class:: `io.papermc.paper.plugin.PluginInitializerManager`
+Source:: `paper-server/src/main/java/io/papermc/paper/plugin/PluginInitializerManager.java`
+
+`PluginInitializerManager.load(OptionSet)` is the second point where bootstrap is invoked
+(idempotency means the second call is essentially a no-op, returning the cached failure
+set from the first call).
+Its job at this stage is:
+
+. Call `LaminateMixinBootstrap.bootstrap(...)` with the same paths.
+. Call `EntrypointUtil.registerProvidersFromSource(...)` for the plugin directory and all
+  `--add-plugin`/`--add-plugin-dir` inputs.
+. Remove from all provider storages any provider whose lower-case name appears in
+  `failedHybridPlugins`.
+. Partition the remaining providers into three categories and log counts:
++
+[cols="1,2"]
+|===
+|Category |Predicate
+
+|Laminate plugins
+|`provider instanceof LaminatePluginProvider`
+
+|Paper plugins
+|`provider instanceof PaperPluginParent.PaperServerPluginProvider`
+
+|Bukkit/Legacy plugins
+|`provider instanceof SpigotPluginProvider` (but not `LaminatePluginProvider`)
+|===
+
+`LaminatePluginProvider` is checked first because it is a subtype of `SpigotPluginProvider`.
+
+=== 5.3. `PluginInitializerManager.reload()`
+
+This method handles `/reload`.
+When any `LaminatePluginProvider` is registered, it emits a prominent warning:
+
+----
+You are reloading while having Laminate hybrid plugins installed.
+Laminate hybrid plugins do NOT support being reloaded.
+Mixin bytecode transformations are permanent for the lifetime of this server process.
+----
+
+This is a _warning_, not a hard block at the `reload` level; the hard block is in
+`ReloadCommand`, which refuses to run `/reload` at all when any hybrid plugin is active.

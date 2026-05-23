@@ -1,0 +1,146 @@
+# .github/workflows/release.yml
+#
+# Triggered on every pushed tag (e.g. v1.21.11-R0.1, 1.21.11-R0.1-SNAPSHOT).
+# Builds laminate-server-<version>.jar  (createLaminateServerJar task)
+# and     laminate-api-<version>.jar    (laminate-api:jar task),
+# then creates a GitHub Release and attaches both artifacts.
+
+name: Release Laminate
+
+on:
+  push:
+    tags:
+      - '**'   # every tag triggers this workflow
+
+jobs:
+  release:
+    name: Build & Publish Release
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write   # required to create a GitHub Release and upload assets
+
+    env:
+      ORG_GRADLE_PROJECT_paperBuildCacheEnabled: true
+      ORG_GRADLE_PROJECT_paperBuildCacheUsername: ${{ secrets.PAPER_BUILD_CACHE_USERNAME }}
+      ORG_GRADLE_PROJECT_paperBuildCachePassword: ${{ secrets.PAPER_BUILD_CACHE_PASSWORD }}
+      ORG_GRADLE_PROJECT_paperBuildCachePush: false   # read-only cache on release builds
+
+    steps:
+      # -------------------------------------------------------------------------
+      # 1. Checkout — full history so git describe / git log work inside Gradle
+      # -------------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      # -------------------------------------------------------------------------
+      # 2. Toolchain
+      # -------------------------------------------------------------------------
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: 21
+          distribution: zulu
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: true   # tag builds should never populate the shared cache
+
+      # -------------------------------------------------------------------------
+      # 3. Git identity (required by applyPatches)
+      # -------------------------------------------------------------------------
+      - name: Configure Git identity
+        run: |
+          git config --global user.email "no-reply@github.com"
+          git config --global user.name  "GitHub Actions"
+
+      # -------------------------------------------------------------------------
+      # 4. Apply patches
+      # -------------------------------------------------------------------------
+      - name: Apply Patches
+        run: ./gradlew applyPatches --stacktrace
+
+      # -------------------------------------------------------------------------
+      # 5. Assemble artifacts
+      #    • createLaminateServerJar  → paper-server/build/libs/laminate-server-*.jar
+      #    • :laminate-api:jar        → laminate-api/build/libs/laminate-api-*.jar
+      # -------------------------------------------------------------------------
+      - name: Build Laminate Server JAR
+        run: ./gradlew :paper-server:createLaminateServerJar --stacktrace
+
+      - name: Build Laminate API JAR
+        run: ./gradlew :laminate-api:jar --stacktrace
+
+      # -------------------------------------------------------------------------
+      # 6. Locate the produced files so the upload step has exact paths
+      # -------------------------------------------------------------------------
+      - name: Locate artifacts
+        id: artifacts
+        run: |
+          SERVER_JAR=$(find paper-server/build/libs -name 'laminate-server-*.jar' | head -1)
+          API_JAR=$(find laminate-api/build/libs    -name 'laminate-api-*.jar'    | head -1)
+
+          if [ -z "$SERVER_JAR" ]; then echo "ERROR: laminate-server jar not found" && exit 1; fi
+          if [ -z "$API_JAR"    ]; then echo "ERROR: laminate-api jar not found"    && exit 1; fi
+
+          echo "server_jar=$SERVER_JAR" >> "$GITHUB_OUTPUT"
+          echo "api_jar=$API_JAR"       >> "$GITHUB_OUTPUT"
+
+          echo "Found server jar : $SERVER_JAR"
+          echo "Found API jar    : $API_JAR"
+
+      # -------------------------------------------------------------------------
+      # 7. Create GitHub Release and upload both JARs
+      #    • The release name and body are derived from the pushed tag.
+      #    • draft: false / prerelease: auto-detected from tag suffix (-SNAPSHOT,
+      #      -beta, -rc → pre-release; anything else → stable release).
+      # -------------------------------------------------------------------------
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/github-script@v7
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        with:
+          script: |
+            const tag = process.env.TAG_NAME;
+            const isPrerelease = /snapshot|alpha|beta|rc/i.test(tag);
+
+            const { data: release } = await github.rest.repos.createRelease({
+              owner:   context.repo.owner,
+              repo:    context.repo.repo,
+              tag_name:         tag,
+              name:             `Laminate ${tag}`,
+              body:             `## Laminate ${tag}\n\n### Artifacts\n| File | Description |\n|------|-------------|\n| \`laminate-server-*.jar\` | Self-launching server JAR (includes bundled mixin agent) |\n| \`laminate-api-*.jar\` | Laminate API JAR for plugin developers |`,
+              draft:            false,
+              prerelease:       isPrerelease,
+              make_latest:      isPrerelease ? "false" : "true",
+            });
+
+            core.setOutput("upload_url", release.upload_url);
+            core.setOutput("release_id",  String(release.id));
+            core.notice(`Created release: ${release.html_url}`);
+
+      - name: Upload laminate-server JAR
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url:         ${{ steps.create_release.outputs.upload_url }}
+          asset_path:         ${{ steps.artifacts.outputs.server_jar }}
+          asset_name:         laminate-server-${{ github.ref_name }}.jar
+          asset_content_type: application/java-archive
+
+      - name: Upload laminate-api JAR
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url:         ${{ steps.create_release.outputs.upload_url }}
+          asset_path:         ${{ steps.artifacts.outputs.api_jar }}
+          asset_name:         laminate-api-${{ github.ref_name }}.jar
+          asset_content_type: application/java-archive
+

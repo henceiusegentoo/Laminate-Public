@@ -1,0 +1,240 @@
+// ============================================================
+[[mixin-subsystem]]
+== 6. Mixin Bootstrap Subsystem
+// ============================================================
+
+All classes in this section live under
+`paper-server/src/main/java/io/papermc/paper/mixin/`.
+
+=== 6.1. Public façade: `LaminateMixinBootstrap`
+
+Class:: `io.papermc.paper.mixin.LaminateMixinBootstrap`
+
+[source,java]
+----
+public static Set<String> bootstrap(
+    Path pluginDir,
+    List<Path> addFiles,
+    List<Path> addDirs
+)
+
+public static Set<String> getLoadedHybridPluginNames()
+----
+
+`bootstrap` delegates to `HybridPluginMixinBootstrap.injectHybridMixins(...)` and returns
+the set of lower-case plugin names whose bootstrap failed (these are removed from provider
+storage by the caller).
+
+`getLoadedHybridPluginNames` returns the names (original case) of plugins that were
+_successfully_ bootstrapped, used by `SpigotPluginProviderFactory` to upgrade providers to
+`LaminatePluginProvider`.
+
+=== 6.2. JAR discovery: `PluginJarScanner`
+
+Class:: `io.papermc.paper.mixin.PluginJarScanner`
+
+[source,java]
+----
+static Set<Path> collectPluginJars(
+    Path defaultPluginDir,
+    List<Path> additionalFiles,
+    List<Path> additionalDirs
+)
+----
+
+Collects all candidate plugin JARs into a de-duplicated `HashSet<Path>` of normalized,
+absolute paths.
+
+Algorithm:
+
+. Call `collectFromDirectory(defaultPluginDir, jars)`.
+. For each path in `additionalFiles`: add if it is an existing regular file ending in
+  `.jar`.
+. For each path in `additionalDirs`: call `collectFromDirectory(dir, jars)`.
+
+`collectFromDirectory` lists the directory with `Files.list()`, filters to regular `.jar`
+files, normalizes each path to absolute form, and adds it to the output set.
+A `null` or non-directory argument is silently ignored.
+An `IOException` during listing is logged as a warning; the partial results are kept.
+
+=== 6.3. Descriptor model: `HybridDescriptor`
+
+[source,java]
+----
+record HybridDescriptor(String name, List<String> mixinConfigs) {}
+----
+
+A plain immutable record.
+`name` is the plugin name as declared in `plugin.yml` (original case).
+`mixinConfigs` is an unmodifiable list of mixin JSON resource paths
+(e.g. `"mixins.myplugin.json"`).
+
+=== 6.4. Descriptor parsing: `HybridDescriptorReader`
+
+Class:: `io.papermc.paper.mixin.HybridDescriptorReader`
+
+[source,java]
+----
+static HybridDescriptor read(Path pluginJar)
+    throws IOException, InvalidConfigurationException
+----
+
+Opens the JAR with `JarFile`, then:
+
+. Looks up the `plugin.yml` entry; returns `null` if absent (not a Bukkit plugin).
+. Reads and parses the YAML with `YamlConfiguration.loadFromString(...)`.
+. Checks `hybrid: true`; returns `null` if false or absent.
+. Reads `name`; throws `InvalidConfigurationException` if blank or absent.
+. Reads `mixins` as `List<String>`; throws if empty.
+. For each config name, verifies a `JarEntry` with that name exists in the JAR; throws
+  if missing.
+. Returns `new HybridDescriptor(name, Collections.unmodifiableList(mixinConfigs))`.
+
+=== 6.5. Main orchestrator: `HybridPluginMixinBootstrap`
+
+Class:: `io.papermc.paper.mixin.HybridPluginMixinBootstrap`
+
+==== 6.5.1. State
+
+[cols="1,1,2"]
+|===
+|Field |Type |Purpose
+
+|`PINNED_MIXIN_LOADERS`
+|`List<URLClassLoader>`
+|Plugin-specific class loaders kept alive so the Mixin transformer can resolve mixin
+classes after bootstrap.
+
+|`LOADED_HYBRID_PLUGIN_NAMES`
+|`Set<String>`
+|Original-case names of successfully bootstrapped plugins.
+
+|`mixinBootstrapped`
+|`volatile boolean`
+|Guards the one-time Mixin subsystem initialisation.
+
+|`mixinPhasesFinished`
+|`volatile boolean`
+|Guards the one-time phase advancement and transformer installation.
+
+|`launcher`
+|`PaperQuiltLauncher`
+|The singleton Quilt launcher instance.
+
+|`cachedFailedPlugins`
+|`volatile Set<String>`
+|Cached result of the first `injectHybridMixins` call; subsequent calls return this
+immediately.
+|===
+
+==== 6.5.2. `injectHybridMixins` — main entry point
+
+[source,java]
+----
+public static Set<String> injectHybridMixins(
+    Path defaultPluginDir,
+    List<Path> addPluginFiles,
+    List<Path> addPluginDirs
+)
+----
+
+. Returns `cachedFailedPlugins` immediately if non-null (idempotency).
+. Calls `PluginJarScanner.collectPluginJars(...)`.
+. For each JAR: calls `processPluginJar(pluginJar, failedPlugins)`.
+. If any injection succeeded or Mixin is already bootstrapped, and phases have not yet
+  been advanced: calls `finishMixinPhases()`, then `installClassFileTransformer()`.
+. If any plugins failed: logs a warning with the count.
+. Caches and returns `Set.copyOf(failedPlugins)`.
+
+==== 6.5.3. `processPluginJar`
+
+. Calls `HybridDescriptorReader.read(pluginJar)`.
+. If `null`: returns `false` (not a hybrid plugin).
+. Calls `injectDescriptor(pluginJar, descriptor)`.
+. On any `Throwable`: logs a warning with the JAR name/plugin name and adds the
+  lower-case plugin name to `failedPlugins`; returns `false`.
+. Returns `true` on success.
+
+==== 6.5.4. `injectDescriptor`
+
+. Calls `ensureMixinBootstrap()` (creates `PaperQuiltLauncher`, sets Mixin service, calls
+  `MixinBootstrap.init()` and `MixinExtrasBootstrap.init()`).
+. Creates a `URLClassLoader` over the plugin JAR URL, with the thread-context class loader
+  as parent.
+. Adds the loader to `PINNED_MIXIN_LOADERS` (keeps it from being GC'd).
+. Calls `registerPluginClassLoader(mixinResourceLoader)` to register it with the launcher.
+. Calls `registerMixinConfigs(mixinResourceLoader, descriptor)`.
+. Adds the plugin name to `LOADED_HYBRID_PLUGIN_NAMES`.
+
+==== 6.5.5. `registerMixinConfigs`
+
+[source,java]
+----
+private static void registerMixinConfigs(
+    URLClassLoader loader,
+    HybridDescriptor descriptor
+)
+----
+
+Temporarily switches `Thread.currentThread().getContextClassLoader()` to `loader` so the
+Mixin subsystem's `ClassLoader.getResourceAsStream(config)` calls find the mixin JSON
+files inside the plugin JAR.
+Then calls `Mixins.addConfiguration(config)` for each entry in
+`descriptor.mixinConfigs()`.
+Restores the previous context class loader in `finally`.
+
+==== 6.5.6. `ensureMixinBootstrap` (synchronized)
+
+[source,java]
+----
+private static synchronized void ensureMixinBootstrap()
+----
+
+One-time initialisation:
+
+. Creates `launcher = new PaperQuiltLauncher()`.
+. Sets `System.setProperty("mixin.service", MixinServiceKnot.class.getName())`.
+. Calls `MixinBootstrap.init()`.
+. Calls `MixinExtrasBootstrap.init()`.
+
+`MixinBootstrap.init()` expects the Quilt launcher to be registered; the
+`PaperQuiltLauncher` constructor calls `QuiltLauncherBase.setLauncher(this)` for this
+reason.
+
+==== 6.5.7. `finishMixinPhases`
+
+`MixinEnvironment.gotoPhase(Phase)` is package-private.
+Laminate accesses it via reflection (the same technique used by Quilt's own
+`QuiltLauncherBase`):
+
+[source,java]
+----
+Method gotoPhase = MixinEnvironment.class.getDeclaredMethod(
+    "gotoPhase", MixinEnvironment.Phase.class);
+gotoPhase.setAccessible(true);
+gotoPhase.invoke(null, MixinEnvironment.Phase.INIT);
+gotoPhase.invoke(null, MixinEnvironment.Phase.DEFAULT);
+----
+
+This advances the environment from `PREINIT` → `INIT` → `DEFAULT`.
+After this point, mixin configurations are locked; no more configs can be added.
+
+==== 6.5.8. `installClassFileTransformer`
+
+. Obtains the `IMixinTransformer` from `MixinServiceKnot.getTransformer()` via reflection.
+. Retrieves `Instrumentation` from `PaperMixinAgent.getInstrumentation()`.
+. If `null`: logs a warning that transformations will not apply and returns.
+. Creates `new PaperMixinClassFileTransformer(mixinTransformer)`.
+. Calls `instrumentation.addTransformer(transformer, true)` (`true` = supports
+  retransformation).
+. Calls `retransformAlreadyLoadedClasses(instrumentation)` as a safety net.
+
+==== 6.5.9. `retransformAlreadyLoadedClasses`
+
+Finds all classes loaded before the transformer was installed that start with
+`net.minecraft.` and are marked modifiable by `instrumentation.isModifiableClass()`.
+Retransforms each individually with `instrumentation.retransformClasses(clazz)`.
+
+Individual retransformation (one class per call) is intentional: a
+`UnsupportedOperationException` on one class (schema-changing mixin against an already-
+loaded class) can be caught and logged without aborting the rest.

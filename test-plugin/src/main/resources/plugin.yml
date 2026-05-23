@@ -1,0 +1,13 @@
+name: test-plugin
+version: '$version'
+
+main: eu.lschreiber.testplugin.TestPlugin
+api-version: '1.21'
+load: POSTWORLD
+
+authors: [ leander ]
+
+hybrid: true
+mixins:
+  - mixins.testplugin.json
+  - mixins.testplugin.generated.json

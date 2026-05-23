@@ -1,0 +1,100 @@
+// ============================================================
+[[launcher]]
+== 3. Self-Launching Entry Point
+// ============================================================
+
+Class:: `io.papermc.paper.LaminateLauncher`
+Source:: `paper-server/src/main/java/io/papermc/paper/LaminateLauncher.java`
+
+=== 3.1. Purpose
+
+The Laminate server JAR must be started with two things that ordinary operators do not
+supply:
+
+. `-javaagent:self` — so <<agent,`PaperMixinAgent`>> runs before `main()` and captures
+  the JVM's `Instrumentation` handle.
+. Four `--add-opens` flags — so the Quilt/Knot mixin framework can access sealed JDK
+  packages via reflection.
+
+`LaminateLauncher` eliminates both requirements for the operator.
+It is the `Main-Class` in the distribution JAR's manifest.
+On a first launch (no agent), it relaunches itself with all required flags.
+On the second JVM (agent already ran), it delegates to the Paperclip bundler.
+
+=== 3.2. Detection mechanism
+
+`PaperMixinAgent.premain()` sets the system property `laminate.agent.loaded` before
+`main()` is called.
+
+`LaminateLauncher.main()` checks for this property:
+
+[source,java]
+----
+public static void main(final String[] args) throws Exception {
+    if (System.getProperty(AGENT_LOADED_PROP) != null) {
+        invokeBundlerMain(args);   // agent ran — delegate to Paperclip
+        return;
+    }
+    relaunchWithAgent(args);       // first launch — relaunch with flags
+}
+----
+
+`AGENT_LOADED_PROP = "laminate.agent.loaded"`. The constant is shared between
+`LaminateLauncher` and `PaperMixinAgent` (the latter writes it; the former reads it).
+
+=== 3.3. Relaunch logic (`relaunchWithAgent`)
+
+. Locates the Java executable via `ProcessHandle.current().info().command()`, falling back
+  to `$JAVA_HOME/bin/java`.
+. Locates the running JAR via `LaminateLauncher.class.getProtectionDomain().getCodeSource().getLocation()`.
+. Copies all existing JVM flags from `ManagementFactory.getRuntimeMXBean().getInputArguments()`,
+  stripping any `-javaagent:` entry that points at the same JAR (to avoid a duplicate agent
+  registration) while preserving all other agents (profilers, APM agents, security agents).
+. Appends the four `--add-opens` flags required by Quilt/Knot:
++
+----
+--add-opens=java.base/java.lang=ALL-UNNAMED
+--add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+--add-opens=java.base/java.io=ALL-UNNAMED
+--add-opens=java.base/java.util=ALL-UNNAMED
+----
+. Adds `-javaagent:<selfJar>`.
+. Adds `-jar <selfJar>`.
+. Forwards all application arguments unchanged (`nogui`, `--port`, `--plugins`, etc.).
+. Starts the child process with `ProcessBuilder.inheritIO()` and exits with the child's
+  return code.
+
+=== 3.4. Bundler delegation (`invokeBundlerMain`)
+
+Reads `Bundler-Main-Class` from the JAR manifest (set to `io.papermc.paperclip.Main` in
+`createLaminateServerJar`) and invokes its `main(String[])` via reflection.
+Using the manifest attribute rather than a hard-coded class name keeps the launcher
+agnostic of the specific bundler implementation.
+
+=== 3.5. Manifest attributes set by `createLaminateServerJar`
+
+[cols="1,2"]
+|===
+|Attribute |Value
+
+|`Main-Class`
+|`io.papermc.paper.LaminateLauncher`
+
+|`Bundler-Main-Class`
+|`io.papermc.paperclip.Main`
+
+|`Premain-Class`
+|`io.papermc.paper.mixin.PaperMixinAgent`
+
+|`Agent-Class`
+|`io.papermc.paper.mixin.PaperMixinAgent`
+
+|`Can-Retransform-Classes`
+|`true`
+
+|`Can-Redefine-Classes`
+|`true`
+|===
+
+The same JAR file thus serves triple duty: application entrypoint, Paperclip bundler host,
+and Java agent.

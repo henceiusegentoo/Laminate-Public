@@ -1,0 +1,9 @@
+{
+  "required": true,
+  "package": "eu.lschreiber.testplugin.mixins",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "ServerMixin",
+    "ServerLevelMixin"
+  ]
+}

@@ -1,0 +1,75 @@
+// ============================================================
+[[operational-guide]]
+== 13. Operator and Author Guidance
+// ============================================================
+
+=== 13.1. Minimum requirements
+
+[cols="1,2"]
+|===
+|Requirement |Detail
+
+|Java version
+|Java 21 or later (required by Paper 1.21.11 and by Laminate's annotation processors).
+
+|Launch command
+|`java -jar laminate-server-<version>.jar [server-args]` — no additional JVM flags needed.
+
+|Plugin directory
+|Standard Paper `plugins/` directory; hybrid plugins are discovered alongside ordinary
+plugins.
+|===
+
+=== 13.2. How Laminate selects JVM flags on relaunch
+
+The `--add-opens` flags are required because Quilt Loader (and by extension
+`MixinServiceKnot`) uses reflection to access sealed JDK packages:
+
+[cols="1,2"]
+|===
+|Flag |Why needed
+
+|`--add-opens=java.base/java.lang=ALL-UNNAMED`
+|Accessing `ClassLoader` internals for class bytes.
+
+|`--add-opens=java.base/java.lang.reflect=ALL-UNNAMED`
+|Accessing method and field reflective objects.
+
+|`--add-opens=java.base/java.io=ALL-UNNAMED`
+|Accessing `InputStream` internals for resource loading.
+
+|`--add-opens=java.base/java.util=ALL-UNNAMED`
+|Accessing `Hashtable` (used by `System.getProperties()`).
+|===
+
+=== 13.3. `/reload` behaviour
+
+Laminate blocks `/reload` at the command level when any `LaminatePluginProvider` is
+active.
+The underlying reason: `ClassFileTransformer` modifications are committed to the JVM's
+class bytes for the lifetime of the process.
+There is no JVM API to undo a bytecode transformation once applied.
+
+=== 13.4. Writing a hybrid plugin — checklist
+
+. Declare `hybrid: true` in `plugin.yml`.
+. List every mixin JSON config file in the `mixins:` array.
+  If using `@InjectEvent`, include `mixins.<plugin>.generated.json`.
+. Target all mixins against Mojang-mapped names.
+  `PaperQuiltLauncher.getTargetNamespace()` returns `"mojang"`;
+  no runtime remapping is provided.
+. Prefix all mixin-injected fields and methods with a plugin-unique namespace
+  (`yourpluginid$`).
+  Laminate does not change Mixin's collision model.
+. Do not shade `laminate-api`, `sponge-mixin`, or `mixinextras-common`.
+  These are on the server classpath.
+. Restart (not reload) is the lifecycle boundary for hybrid plugins.
+
+=== 13.5. Failed hybrid bootstrap
+
+If `HybridDescriptorReader.read()` throws, or any step of `injectDescriptor` fails, the
+plugin's lower-case name is added to `failedHybridPlugins`.
+After scanning all JARs, `PluginInitializerManager.load()` removes any provider whose
+name matches a failed plugin.
+The server continues starting; the broken plugin is simply absent.
+Logs will contain a warning identifying the failure with the JAR path and exception.

@@ -1,0 +1,43 @@
+= Laminate Internals
+:toc: left
+:toclevels: 4
+:sectanchors:
+:sectlinks:
+:source-highlighter: rouge
+
+This document describes the internal design and implementation of Laminate, a Paper 1.21.11
+fork that adds first-class support for _hybrid plugins_: standard Bukkit/Paper plugins that
+may also register SpongePowered Mixin bytecode transformations against the live server
+without requiring operators to supply manual JVM flags or install a separate mod loader.
+
+Every question about how the server starts, how mixins are registered, how the plugin
+provider system recognises hybrid plugins, and how `laminate-api` tools work for plugin
+authors should be answerable from the sections that follow.
+
+include::01-how-to-read.adoc[]
+
+include::02-architecture.adoc[]
+
+include::03-launcher.adoc[]
+
+include::04-agent.adoc[]
+
+include::05-bootstrap.adoc[]
+
+include::06-mixin-subsystem.adoc[]
+
+include::07-quilt-adapter.adoc[]
+
+include::08-transformer.adoc[]
+
+include::09-plugin-provider.adoc[]
+
+include::10-laminate-api.adoc[]
+
+include::11-test-plugin.adoc[]
+
+include::12-build.adoc[]
+
+include::13-operations.adoc[]
+
+include::14-hybrid-plugin-dev.adoc[]

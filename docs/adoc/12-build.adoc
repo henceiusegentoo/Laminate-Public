@@ -1,0 +1,128 @@
+// ============================================================
+[[build-distribution]]
+== 12. Build and Distribution
+// ============================================================
+
+=== 12.1. Gradle module layout
+
+[cols="1,2"]
+|===
+|Module |Role
+
+|`paper-api`
+|Public API; Laminate adds branding metadata (`Brand-Id: lschreiber:laminate`).
+
+|`paper-server`
+|Server implementation; all mixin integration lives here.
+
+|`laminate-api`
+|Annotation processors + runtime bridges; first-class `includedBuild` module.
+
+|`test-plugin`
+|Reference hybrid plugin; optional module.
+
+|`paper-generator`
+|Paper's upstream code generator; unchanged.
+|===
+
+`settings.gradle.kts` sets `rootProject.name = "laminate"`.
+`gradle.properties` sets `group=eu.lschreiber.laminate`.
+
+=== 12.2. `paper-server` dependency additions
+
+[cols="1,1,2"]
+|===
+|Dependency |Configuration |Purpose
+
+|`project(":laminate-api")`
+|`implementation`
+|Puts `laminate-api` runtime classes on the server classpath for generated mixin companions.
+
+|`org.quiltmc:quilt-loader:0.30.0-beta.7`
+|`implementation`
+|Provides `QuiltLauncherBase`, `MixinServiceKnot`.
+
+|`net.fabricmc:sponge-mixin:0.17.0+mixin.0.8.7`
+|`implementation`
+|SpongePowered Mixin library.
+
+|`io.github.llamalad7:mixinextras-common:0.5.3`
+|`implementation`
+|MixinExtras utility library; initialized via `MixinExtrasBootstrap.init()`.
+
+|`org.ow2.asm:asm-util:9.9.1`
+|`implementation`
+|ASM utilities required by the Mixin/Quilt toolchain.
+|===
+
+=== 12.3. `createLaminateServerJar` task
+
+Produces `laminate-server-<version>.jar` — the single-file operator distribution.
+
+[source,kotlin]
+----
+val createLaminateServerJar by tasks.registering(Jar::class) {
+    archiveBaseName.set("laminate-server")
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
+    // 1. New/updated classes first (shadow anything in the bundler JAR)
+    from(sourceSets.main.get().output) {
+        include(
+            "io/papermc/paper/LaminateLauncher.class",
+            "io/papermc/paper/mixin/PaperMixinAgent.class",
+        )
+    }
+
+    // 2. Merge the entire mojmap bundler JAR
+    from(tasks.createMojmapBundlerJar.flatMap { it.outputZip }.map {
+        archiveOps.zipTree(it.asFile)
+    }) {
+        exclude("META-INF/MANIFEST.MF")
+        exclude("META-INF/*.SF", "META-INF/*.RSA", "META-INF/*.DSA")
+    }
+
+    manifest {
+        attributes(
+            "Main-Class"              to "io.papermc.paper.LaminateLauncher",
+            "Bundler-Main-Class"      to "io.papermc.paperclip.Main",
+            "Premain-Class"           to "io.papermc.paper.mixin.PaperMixinAgent",
+            "Agent-Class"             to "io.papermc.paper.mixin.PaperMixinAgent",
+            "Can-Retransform-Classes" to "true",
+            "Can-Redefine-Classes"    to "true",
+        )
+    }
+}
+----
+
+`DuplicatesStrategy.EXCLUDE` ensures the first encountered copy of a class wins;
+`LaminateLauncher.class` and `PaperMixinAgent.class` are added first so they shadow any
+copies already present in the mojmap bundler JAR.
+
+JAR signing metadata (`*.SF`, `*.RSA`, `*.DSA`) is stripped because signatures become
+invalid after repackaging.
+
+=== 12.4. `agentJar` task
+
+Produces `laminate-mixin-agent.jar` for environments that manage JVM agent flags manually
+rather than relying on the self-relaunching server JAR.
+Contains only `PaperMixinAgent.class` plus the required manifest attributes.
+
+=== 12.5. `runServer` task and test-plugin integration
+
+[source,kotlin]
+----
+if (rootProject.childProjects["test-plugin"] != null) {
+    val testPluginJar = rootProject.project(":test-plugin").tasks.jar.flatMap { it.archiveFile }
+    inputs.file(testPluginJar)
+    args("-add-plugin=${testPluginJar.get().asFile.absolutePath}")
+}
+----
+
+When `test-plugin` is included in the build, `runServer` automatically adds the compiled
+test plugin via `--add-plugin`, keeping the development loop close to real hybrid-plugin
+deployment without copying JARs manually.
+
+=== 12.6. Version-reporting helper tasks
+
+`printLaminateVersion` and `printMinecraftVersion` are registered in the root project
+for CI scripting use.

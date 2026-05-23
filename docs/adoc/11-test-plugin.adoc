@@ -1,0 +1,93 @@
+// ============================================================
+[[test-plugin]]
+== 11. Reference Implementation: `test-plugin`
+// ============================================================
+
+The `test-plugin` module is a complete, self-contained hybrid plugin that exercises every
+Laminate-specific feature.
+Source: `test-plugin/src/main/java/eu/lschreiber/testplugin/`.
+
+=== 11.1. `plugin.yml`
+
+[source,yaml]
+----
+name: test-plugin
+version: '$version'
+main: eu.lschreiber.testplugin.TestPlugin
+api-version: '1.21'
+load: POSTWORLD
+authors: [ leander ]
+hybrid: true
+mixins:
+  - mixins.testplugin.json
+  - mixins.testplugin.generated.json
+----
+
+`hybrid: true` and the `mixins` list are the Laminate-specific additions.
+`mixins.testplugin.json` is the hand-written mixin config; `mixins.testplugin.generated.json`
+is produced by `@InjectEvent`.
+
+=== 11.2. Hand-written mixin: `ServerMixin`
+
+[source,java]
+----
+@Mixin(MinecraftServer.class)
+public final class ServerMixin {
+
+    @GenerateAccessor(name = "write")
+    @Unique
+    public void testPlugin$write(final String msg) {
+        System.out.println("[test-plugin] write() injected via mixin: " + msg);
+    }
+}
+----
+
+`@Unique` tells SpongePowered Mixin that this method is added by this mixin and should
+not conflict with existing methods.
+`testPlugin$` is a plugin-unique name prefix; collisions across mixins from different
+plugins are a process-level error.
+
+`@GenerateAccessor(name = "write")` causes the processor to generate
+`MinecraftServerAccessor` in `eu.lschreiber.testplugin.accessor`, with an interface
+method `void write(String p0)` and an `of(Object)` factory.
+
+=== 11.3. Generated event bridge: `ServerLevelMixin`
+
+[source,java]
+----
+@Mixin(ServerLevel.class)
+public abstract class ServerLevelMixin {
+
+    @Unique
+    @InjectEvent(
+            method = "tick",
+            at = At.HEAD,
+            event = ServerLevelTickStartEvent.class
+    )
+    private void testPlugin$onTick(BooleanSupplier hasTime) {
+        // Marker — @InjectEvent processor generates the actual injection.
+    }
+}
+----
+
+The marker method body is never executed; the processor generates a separate companion
+mixin class that contains the real `@Inject` bytecode.
+
+=== 11.4. Plugin entrypoint: `TestPlugin`
+
+[source,java]
+----
+@Override
+public void onEnable() {
+    getServer().getPluginManager().registerEvents(new TickListener(), this);
+    registerCommands();
+}
+----
+
+`registerCommands()` registers a `/testcmd` Brigadier command that:
+
+. Obtains the `MinecraftServer` instance via `((CraftServer) getServer()).getServer()`.
+. Wraps it in a `MinecraftServerAccessor` via `MinecraftServerAccessor.of(server)`.
+. Calls `accessor.write("Hello World")` — which routes through the proxy and
+  `MethodHandle` to the mixin-injected `testPlugin$write` method on the live
+  `MinecraftServer` instance.

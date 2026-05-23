@@ -1,0 +1,48 @@
+// ============================================================
+[[agent]]
+== 4. Java Agent
+// ============================================================
+
+Class:: `io.papermc.paper.mixin.PaperMixinAgent`
+Source:: `paper-server/src/main/java/io/papermc/paper/mixin/PaperMixinAgent.java`
+
+=== 4.1. Purpose
+
+`PaperMixinAgent` is intentionally minimal.
+Its only job is to accept the JVM's `Instrumentation` instance from the JVM launcher
+protocol and make it available to the rest of the bootstrap chain.
+
+=== 4.2. `premain` / `agentmain`
+
+[source,java]
+----
+public static void premain(final String args, final Instrumentation inst) {
+    System.setProperty(LAUNCHER_SIGNAL_PROP, "true");
+    System.getProperties().put(INSTRUMENTATION_KEY, inst);
+}
+
+public static void agentmain(final String args, final Instrumentation inst) {
+    premain(args, inst);
+}
+----
+
+`LAUNCHER_SIGNAL_PROP = "laminate.agent.loaded"` — signals `LaminateLauncher` that this
+JVM is correctly configured.
+
+`INSTRUMENTATION_KEY = "paper.mixin.instrumentation"` — the `Instrumentation` object is
+stored in `System.getProperties()` (a JVM-global `Hashtable` that is reachable across all
+class loaders) so that `HybridPluginMixinBootstrap` can retrieve it later without any
+shared static reference.
+
+=== 4.3. `getInstrumentation()`
+
+[source,java]
+----
+static Instrumentation getInstrumentation() {
+    final Object obj = System.getProperties().get(INSTRUMENTATION_KEY);
+    return (obj instanceof Instrumentation inst) ? inst : null;
+}
+----
+
+Returns `null` if the agent was never loaded; `HybridPluginMixinBootstrap` checks for
+this case and logs a clear warning rather than crashing.

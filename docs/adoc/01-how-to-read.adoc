@@ -1,0 +1,18 @@
+== 1. How to read this document
+
+Sections 2 through 6 cover the server-startup and mixin-bootstrap path in execution order:
+architecture overview, self-launching entry point, Java agent, bootstrap coordination, and
+the full mixin bootstrap subsystem.
+
+Sections 7 and 8 cover the Quilt/Knot adapter (`PaperQuiltLauncher`) and the JVM
+class-file transformer (`PaperMixinClassFileTransformer`).
+
+Section 9 covers the plugin provider system.
+Section 10 covers the `laminate-api` module (annotation processors and runtime bridges).
+Section 11 is a walkthrough of the reference hybrid plugin (`test-plugin`).
+Section 12 covers build and distribution.
+Section 13 covers operator and author guidance.
+Section 14 is a step-by-step guide to developing your own hybrid plugin.
+
+All class references use their simple name where unambiguous; fully-qualified names are given
+the first time a class is introduced. Source paths are relative to the repository root.

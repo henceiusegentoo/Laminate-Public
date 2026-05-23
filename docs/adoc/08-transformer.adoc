@@ -1,0 +1,57 @@
+// ============================================================
+[[transformer]]
+== 8. JVM Class-File Transformer
+// ============================================================
+
+Class:: `io.papermc.paper.mixin.PaperMixinClassFileTransformer`
+Source:: `paper-server/src/main/java/io/papermc/paper/mixin/PaperMixinClassFileTransformer.java`
+
+=== 8.1. Lifecycle
+
+. Created by `HybridPluginMixinBootstrap.installClassFileTransformer()`.
+. Registered with the JVM via `Instrumentation.addTransformer(transformer, true)`.
+. For every class the JVM loads or retransforms, the JVM calls `transform(...)`.
+
+=== 8.2. `transform` implementation
+
+[source,java]
+----
+public byte[] transform(
+    ClassLoader loader,
+    String className,        // slash-separated, e.g. "net/minecraft/server/MinecraftServer"
+    Class<?> classBeingRedefined,
+    ProtectionDomain protectionDomain,
+    byte[] classfileBuffer
+)
+----
+
+. Returns `null` immediately if `className == null`.
+. Converts `className` from slash-separated to dot-separated.
+. Calls `canTransform(dotName)`; returns `null` if blocked.
+. Delegates to `mixinTransformer.transformClassBytes(dotName, dotName, classfileBuffer)`.
+. Returns the transformed bytes if they differ from the input; returns `null` otherwise.
+. Catches any `Throwable`: logs an error and returns `null` (class loads untransformed).
+
+Returning `null` from a `ClassFileTransformer` signals "no change" to the JVM; this is
+correct and avoids unnecessary byte-array copies for classes that no mixin targets.
+
+=== 8.3. `canTransform` — exclusion list
+
+The following prefixes are excluded from transformation:
+
+[cols="1,2"]
+|===
+|Excluded prefix |Reason
+
+|`org.apache.logging.log4j.`
+|Logging infrastructure; transforming it would cause circularity during error logging inside the transformer.
+
+|`org.spongepowered.asm.`
+|Mixin framework itself; would be a circular dependency.
+
+|`org.objectweb.asm.`
+|ASM bytecode library used by Mixin; same reason.
+
+|`io.papermc.paper.mixin.`
+|Laminate's own mixin infrastructure; transforming it could break the transformer itself.
+|===

@@ -1,0 +1,81 @@
+// ============================================================
+[[quilt-launcher]]
+== 7. Quilt/Knot Adapter
+// ============================================================
+
+Class:: `io.papermc.paper.mixin.PaperQuiltLauncher`
+Source:: `paper-server/src/main/java/io/papermc/paper/mixin/PaperQuiltLauncher.java`
+
+=== 7.1. Purpose
+
+`MixinServiceKnot` (the Mixin service implementation shipped by Quilt Loader) expects to
+find a `QuiltLauncher` registered in `QuiltLauncherBase` from which it can:
+
+* look up class bytes
+* look up resources
+* query whether a class is already loaded
+* retrieve mapping configuration
+
+`PaperQuiltLauncher` satisfies this contract, bridging Paper's runtime environment into
+the Quilt/Knot mixin infrastructure.
+
+=== 7.2. Key design decisions vs. Quilt's Knot
+
+[cols="1,2,2"]
+|===
+|Feature |Quilt Knot |PaperQuiltLauncher
+
+|Class bytes
+|Read via `KnotClassDelegate` from Knot's own class loader
+|Read from server class loader, then thread-context loader, then registered plugin loaders
+
+|`isClassLoaded`
+|Probes `findLoadedClass()` honestly
+|Always returns `false` to prevent `MixinTargetAlreadyLoadedException`; already-loaded
+classes are handled by retransformation
+
+|Mapping configuration
+|Full Quilt mapping pipeline
+|Returns `null`; Paper ships Mojang-mapped and no runtime remapping is needed
+
+|Target namespace
+|Configured at launch
+|Hard-coded to `"mojang"`
+
+|Class-path management
+|Knot dynamically adds paths to its loader
+|Tracks registered `URLClassLoader` instances in a `CopyOnWriteArrayList`
+
+|Game transformer
+|`GameTransformer` with entry-point processing
+|Returns an empty no-op `GameTransformer`
+|===
+
+=== 7.3. Resource search order
+
+Both `findResource(String name)` and `findResourceUrl(String name)` follow the same
+three-step search:
+
+. Server class loader (`getClass().getClassLoader()`).
+. Thread-context class loader, if it differs from the server loader.
+. Each registered plugin `URLClassLoader` in insertion order.
+
+Returns the first result found, or `null`.
+
+Thread safety: `pluginClassLoaders` is a `CopyOnWriteArrayList`.
+Writes (one per hybrid plugin during bootstrap) are rare; reads (on every class load from
+the Mixin transformer) are frequent.
+`CopyOnWriteArrayList` provides lock-free snapshot iteration for reads.
+
+=== 7.4. No-op overrides
+
+Several `QuiltLauncher` methods are relevant only to Quilt's own class-isolation model
+and are intentionally empty or return fixed values in `PaperQuiltLauncher`:
+
+* `setAllowedPrefixes` — Paper does not enforce class-prefix isolation.
+* `setTransformCache` — Paper does not use Quilt's transform caching.
+* `setHiddenClasses` — Paper does not enforce class hiding.
+* `setPluginPackages` — Paper does not enforce plugin-package isolation.
+* `hideParentUrl` / `hideParentPath` — not applicable.
+* `validateGameClassLoader` — not applicable.
+* `getManifest` — returns `null`.
