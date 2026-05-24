@@ -29,4 +29,4 @@ For detailed documentation see the [Laminate Wiki](https://github.com/henceiuseg
 - [Building from Source](https://github.com/henceiusegentoo/Laminate-Public/wiki/Building-from-Source): build steps, Gradle tasks, and the test-plugin module
 - [Troubleshooting](https://github.com/henceiusegentoo/Laminate-Public/wiki/Troubleshooting): common errors and fixes
 
-> Comprehensive technical docs [here](/docs/adoc)
+> Comprehensive technical docs [here](/docs/adoc/index.adoc)
