@@ -12,17 +12,7 @@ import javax.tools.Diagnostic;
 import java.util.List;
 import java.util.Map;
 
-/**
- * Resolves the target class declared in a {@code @Mixin} annotation.
- *
- * <p>Both {@code @Mixin(SomeClass.class)} (the {@code value} attribute) and
- * {@code @Mixin(targets = "com.example.SomeClass")} (the {@code targets}
- * attribute) are supported. Only single-target mixins are supported; a
- * compile-time error is emitted when multiple targets are declared.</p>
- *
- * <p>This utility is shared between {@code GenerateAccessorProcessor} and
- * {@code InjectEventProcessor} to avoid code duplication.</p>
- */
+/** Resolves the single target declared on a {@code @Mixin} annotation. */
 public final class MixinTargetResolver {
 
     private static final String MIXIN_FQN = "org.spongepowered.asm.mixin.Mixin";
@@ -30,15 +20,7 @@ public final class MixinTargetResolver {
     private MixinTargetResolver() {
     }
 
-    /**
-     * Resolves the single mixin target from the {@code @Mixin} annotation on
-     * the given type element.
-     *
-     * @param mixinClass the mixin class element annotated with {@code @Mixin}
-     * @param env        the processing environment for type utilities
-     * @param caller     a short label for error messages (e.g. {@code "@GenerateAccessor"})
-     * @return the resolved target, or {@code null} if resolution failed
-     */
+    /** Resolves the mixin target for a class. */
     public static MixinTarget resolve(final TypeElement mixinClass,
                                       final ProcessingEnvironment env,
                                       final String caller) {
@@ -55,7 +37,7 @@ public final class MixinTargetResolver {
             final Map<? extends ExecutableElement, ? extends AnnotationValue> values =
                     mirror.getElementValues();
 
-            for (final var entry : values.entrySet()) {
+            for (final Map.Entry<? extends ExecutableElement, ? extends AnnotationValue> entry : values.entrySet()) {
                 final String attrName = entry.getKey().getSimpleName().toString();
 
                 if ("value".equals(attrName)) {
@@ -70,23 +52,14 @@ public final class MixinTargetResolver {
         return null;
     }
 
-    /**
-     * Extracts the target from the {@code value} attribute ({@code Class<?>[]}).
-     */
     private static MixinTarget resolveFromValueAttr(final AnnotationValue annotationValue,
                                                     final TypeElement mixinClass,
                                                     final ProcessingEnvironment env,
                                                     final Messager messager,
                                                     final String caller) {
-        final Object raw = annotationValue.getValue();
-        if (!(raw instanceof List<?> list) || list.isEmpty()) {
-            return null;
-        }
-
-        if (list.size() > 1) {
-            messager.printMessage(Diagnostic.Kind.ERROR,
-                    "@Mixin has multiple targets; " + caller + " supports only one",
-                    mixinClass);
+        final List<?> list = asSingleAnnotationValueList(annotationValue);
+        if (list == null) {
+            reportSingleTargetError(mixinClass, messager, caller);
             return null;
         }
 
@@ -102,22 +75,13 @@ public final class MixinTargetResolver {
         return null;
     }
 
-    /**
-     * Extracts the target from the {@code targets} attribute ({@code String[]}).
-     */
     private static MixinTarget resolveFromTargetsAttr(final AnnotationValue annotationValue,
                                                       final TypeElement mixinClass,
                                                       final Messager messager,
                                                       final String caller) {
-        final Object raw = annotationValue.getValue();
-        if (!(raw instanceof List<?> list) || list.isEmpty()) {
-            return null;
-        }
-
-        if (list.size() > 1) {
-            messager.printMessage(Diagnostic.Kind.ERROR,
-                    "@Mixin has multiple targets; " + caller + " supports only one",
-                    mixinClass);
+        final List<?> list = asSingleAnnotationValueList(annotationValue);
+        if (list == null) {
+            reportSingleTargetError(mixinClass, messager, caller);
             return null;
         }
 
@@ -129,11 +93,30 @@ public final class MixinTargetResolver {
         return new MixinTarget(simpleName, fqn);
     }
 
+    private static List<?> asSingleAnnotationValueList(final AnnotationValue annotationValue) {
+        final Object raw = annotationValue.getValue();
+        if (!(raw instanceof List<?> list) || list.isEmpty()) {
+            return null;
+        }
+        if (list.size() > 1) {
+            return null;
+        }
+        return list;
+    }
+
+    private static void reportSingleTargetError(final TypeElement mixinClass,
+                                                final Messager messager,
+                                                final String caller) {
+        messager.printMessage(Diagnostic.Kind.ERROR,
+                "@Mixin has multiple targets; " + caller + " supports only one",
+                mixinClass);
+    }
+
     /**
      * Holds the resolved target class identity.
      *
-     * @param simpleName the unqualified class name (e.g. {@code "ServerLevel"})
-     * @param fqn        the fully-qualified class name (e.g. {@code "net.minecraft.server.level.ServerLevel"})
+     * @param simpleName target simple name
+     * @param fqn target fully-qualified name
      */
     public record MixinTarget(String simpleName, String fqn) {
     }

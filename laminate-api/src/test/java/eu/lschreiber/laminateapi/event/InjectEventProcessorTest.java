@@ -30,9 +30,6 @@ class InjectEventProcessorTest {
         @Test
         @DisplayName("returns true for bare method name (no descriptor) — defaults to void")
         void bareMethodNameDefaultsToVoid() {
-            // method = "tick" without a JVM descriptor: no ')' present.
-            // The processor cannot determine the return type; void is assumed
-            // because the vast majority of NMS injection targets are void.
             assertThat(InjectEventProcessor.isVoidReturn("tick")).isTrue();
         }
 
@@ -49,8 +46,6 @@ class InjectEventProcessorTest {
         }
     }
 
-    // ...existing code...
-
     @Nested
     @DisplayName("sanitize")
     class Sanitize {
@@ -58,40 +53,32 @@ class InjectEventProcessorTest {
         @Test
         @DisplayName("replaces dollar signs with underscores")
         void replacesDollarSigns() {
-            // Arrange & Act
             final String result = InjectEventProcessor.sanitize("test$method");
 
-            // Assert
             assertThat(result).isEqualTo("test_method");
         }
 
         @Test
         @DisplayName("replaces dots with underscores")
         void replacesDots() {
-            // Arrange & Act
             final String result = InjectEventProcessor.sanitize("com.example");
 
-            // Assert
             assertThat(result).isEqualTo("com_example");
         }
 
         @Test
         @DisplayName("leaves clean names unchanged")
         void leavesCleanNamesUnchanged() {
-            // Arrange & Act
             final String result = InjectEventProcessor.sanitize("cleanName");
 
-            // Assert
             assertThat(result).isEqualTo("cleanName");
         }
 
         @Test
         @DisplayName("handles multiple special characters")
         void handlesMultipleSpecialChars() {
-            // Arrange & Act
             final String result = InjectEventProcessor.sanitize("a$b.c$d");
 
-            // Assert
             assertThat(result).isEqualTo("a_b_c_d");
         }
     }

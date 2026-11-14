@@ -5,6 +5,7 @@ import eu.lschreiber.laminateapi.internal.MixinTargetResolver.MixinTarget;
 import java.io.IOException;
 import java.io.Writer;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -27,42 +28,15 @@ import javax.tools.FileObject;
 import javax.tools.JavaFileObject;
 import javax.tools.StandardLocation;
 
-/**
- * Annotation processor for {@link InjectEvent}.
- *
- * <p>For each annotated marker method, the processor:</p>
- * <ol>
- *   <li>Validates the mixin context and annotation attributes.</li>
- *   <li>Reads the {@link Rewrite @Rewrite} descriptor.</li>
- *   <li>Generates a companion Mixin class that injects at the specified point
- *       and fires the given Bukkit event via {@link LaminateEventBridge}.</li>
- *   <li>In the final processing round, writes a Mixin JSON configuration file
- *       (e.g. {@code mixins.testplugin.generated.json}) that lists all
- *       generated companion classes. The developer must add this filename
- *       to the {@code mixins} list in {@code plugin.yml} once.</li>
- * </ol>
- *
- * <p>The config filename is derived from the mixin package: trailing
- * {@code .mixins} or {@code .mixin} segments are stripped and the last
- * remaining segment is used as the identifier
- * (e.g. {@code eu.lschreiber.testplugin.mixins} →
- * {@code mixins.testplugin.generated.json}).</p>
- */
+/** Generates companion mixins and config files for {@link InjectEvent}. */
 @SupportedAnnotationTypes("eu.lschreiber.laminateapi.event.InjectEvent")
 @SupportedSourceVersion(SourceVersion.RELEASE_21)
 public final class InjectEventProcessor extends AbstractProcessor {
 
-    /**
-     * Collects generated companion mixin classes across processing rounds,
-     * grouped by the target config filename.
-     */
     private final Map<String, List<MixinConfigEntry>> pendingConfigs = new LinkedHashMap<>();
 
-    /**
-     * Validates that {@code At.INVOKE} injections specify a non-blank target.
-     *
-     * @throws IllegalArgumentException if {@code at=INVOKE} but {@code target()} is blank
-     */
+    private final Set<String> emittedMixinConfigs = new HashSet<>();
+
     private static void validateInvokeTarget(final InjectEvent annotation) {
         if (annotation.at() == At.INVOKE) {
             final String invokeTarget = annotation.target();
@@ -73,22 +47,6 @@ public final class InjectEventProcessor extends AbstractProcessor {
         }
     }
 
-    // ── Per-method processing ───────────────────────────────────────────────
-
-    /**
-     * Resolves the JVM method descriptor from either the {@code method} string
-     * shorthand or the {@code rewrite} annotation on {@link InjectEvent}.
-     *
-     * <ul>
-     *   <li>If {@code method} is non-blank it is returned as-is (simple name or
-     *       full JVM descriptor — Mixin accepts both).</li>
-     *   <li>If {@code rewrite} carries a non-blank {@link Rewrite#method()}
-     *       the descriptor is built from the typed fields.</li>
-     *   <li>Providing both or neither is a compile-time error.</li>
-     * </ul>
-     *
-     * @return the descriptor, or {@code null} if validation failed
-     */
     private static String buildDescriptorFromRewrite(final InjectEvent annotation) {
         final String methodStr = annotation.method();
         final boolean hasString = methodStr != null && !methodStr.isBlank();
@@ -99,7 +57,6 @@ public final class InjectEventProcessor extends AbstractProcessor {
             rewrite = annotation.methodRewrite();
             hasRewrite = rewrite != null && !rewrite.method().isBlank();
         } catch (final Exception ignored) {
-            // annotation.methodRewrite() can throw at compile time; treat as absent
         }
 
         if (hasString && hasRewrite) {
@@ -118,12 +75,6 @@ public final class InjectEventProcessor extends AbstractProcessor {
         return buildDescriptorFromRewriteAnnotation(rewrite);
     }
 
-    /**
-     * Converts a {@link Rewrite} annotation into the full JVM method descriptor
-     * by delegating to {@link RewriteProcessor#toDescriptor(Rewrite)}.
-     *
-     * @throws IllegalArgumentException if the descriptor cannot be built
-     */
     private static String buildDescriptorFromRewriteAnnotation(final Rewrite rewrite) {
         try {
             return RewriteProcessor.toDescriptor(rewrite);
@@ -132,9 +83,6 @@ public final class InjectEventProcessor extends AbstractProcessor {
         }
     }
 
-    /**
-     * Writes the companion Mixin class source code.
-     */
     private static void writeCompanionMixin(
         final Writer writer,
         final String pkg,
@@ -166,8 +114,6 @@ public final class InjectEventProcessor extends AbstractProcessor {
             writer.write("import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;\n\n");
         }
     }
-
-    // ── @Rewrite / String → JVM descriptor ────────────────────────────────
 
     private static void writeMixinAnnotation(
         final Writer writer,
@@ -204,15 +150,12 @@ public final class InjectEventProcessor extends AbstractProcessor {
         writer.write("    }\n");
     }
 
-
-    // ── Event type resolution ───────────────────────────────────────────────
-
     private static void writeCancellableBody(
         final Writer writer,
         final String eventFqn,
         final String extraArgsLiteral
     ) throws IOException {
-        writer.write("        org.bukkit.event.Event _event =\n");
+        writer.write("        org.bukkit.event.Event _event = (org.bukkit.event.Event)\n");
         writer.write("            eu.lschreiber.laminateapi.event.LaminateEventBridge.fireAndReturn(\n");
         writer.write("                \"" + eventFqn + "\", (Object)(Object)this, " + extraArgsLiteral + ");\n");
         writer.write("        if (_event instanceof org.bukkit.event.Cancellable\n");
@@ -220,8 +163,6 @@ public final class InjectEventProcessor extends AbstractProcessor {
         writer.write("            ci.cancel();\n");
         writer.write("        }\n");
     }
-
-    // ── Code generation ─────────────────────────────────────────────────────
 
     private static void writeFireOnlyBody(
         final Writer writer,
@@ -261,19 +202,6 @@ public final class InjectEventProcessor extends AbstractProcessor {
             + "}";
     }
 
-    /**
-     * Derives the mixin config filename from the mixin package.
-     *
-     * <p>Strips a trailing {@code .mixins} or {@code .mixin} segment, then
-     * takes the last remaining segment as the plugin identifier.</p>
-     *
-     * <p>Examples:</p>
-     * <ul>
-     *   <li>{@code eu.lschreiber.testplugin.mixins} → {@code mixins.testplugin.generated.json}</li>
-     *   <li>{@code com.example.myplugin.mixin} → {@code mixins.myplugin.generated.json}</li>
-     *   <li>{@code com.example.myplugin} → {@code mixins.myplugin.generated.json}</li>
-     * </ul>
-     */
     static String resolveConfigFileName(final String mixinPackage) {
         if (mixinPackage.isEmpty()) {
             return "mixins.generated.json";
@@ -293,16 +221,9 @@ public final class InjectEventProcessor extends AbstractProcessor {
         return "mixins." + identifier + ".generated.json";
     }
 
-    /**
-     * Writes the JSON content of a mixin config file.
-     *
-     * <p>When all entries share the same package, the {@code "package"} field
-     * is set and simple class names are used. Otherwise, fully-qualified names
-     * are written without a package field.</p>
-     */
     private static void writeMixinJson(
-        final Writer writer,
-        final List<MixinConfigEntry> entries
+       final Writer writer,
+       final List<MixinConfigEntry> entries
     ) throws IOException {
         final Map<String, List<String>> byPackage = new LinkedHashMap<>();
         for (final MixinConfigEntry e : entries) {
@@ -314,12 +235,12 @@ public final class InjectEventProcessor extends AbstractProcessor {
         writer.write("  \"compatibilityLevel\": \"JAVA_21\",\n");
 
         if (byPackage.size() == 1) {
-            final var single = byPackage.entrySet().iterator().next();
+            final Map.Entry<String, List<String>> single = byPackage.entrySet().iterator().next();
             writer.write("  \"package\": \"" + single.getKey() + "\",\n");
             writeMixinsArray(writer, single.getValue());
         } else {
             final List<String> fqns = new ArrayList<>();
-            for (final var pkgEntry : byPackage.entrySet()) {
+            for (final Map.Entry<String, List<String>> pkgEntry : byPackage.entrySet()) {
                 for (final String cls : pkgEntry.getValue()) {
                     fqns.add(pkgEntry.getKey() + "." + cls);
                 }
@@ -348,12 +269,6 @@ public final class InjectEventProcessor extends AbstractProcessor {
     static boolean isVoidReturn(final String jvmDescriptor) {
         final int closeParenIdx = jvmDescriptor.lastIndexOf(')');
         if (closeParenIdx < 0) {
-            // Bare method name without a return-type descriptor (e.g. "tick").
-            // Mixin resolves the target by name; we cannot determine the return
-            // type at compile time.  Default to void (CallbackInfo) because the
-            // vast majority of NMS injection targets are void methods.
-            // If the target is non-void, use a full JVM descriptor
-            // (e.g. "tick(Ljava/util/function/BooleanSupplier;)V") or @Rewrite.
             return true;
         }
         final String returnDesc = jvmDescriptor.substring(closeParenIdx + 1);
@@ -386,11 +301,6 @@ public final class InjectEventProcessor extends AbstractProcessor {
         return !annotations.isEmpty();
     }
 
-    // ── Mixin config JSON generation ────────────────────────────────────────
-
-    /**
-     * Validates and processes a single {@code @InjectEvent}-annotated method.
-     */
     private void processAnnotatedMethod(final ExecutableElement method) {
         final TypeElement mixinClass = (TypeElement) method.getEnclosingElement();
         final MixinTarget target = resolveMixinTargetOrError(mixinClass);
@@ -436,9 +346,6 @@ public final class InjectEventProcessor extends AbstractProcessor {
         generateCompanionMixin(mixinClass, method, ctx);
     }
 
-    /**
-     * Resolves the {@code @Mixin} target or emits an error.
-     */
     private MixinTarget resolveMixinTargetOrError(final TypeElement mixinClass) {
         final MixinTarget target = MixinTargetResolver.resolve(
             mixinClass, processingEnv, "@InjectEvent");
@@ -449,10 +356,6 @@ public final class InjectEventProcessor extends AbstractProcessor {
         return target;
     }
 
-    /**
-     * Emits a warning if {@code cancellable=true} but the event class does not
-     * implement {@code Cancellable}.
-     */
     private void warnIfNotCancellable(
         final InjectEvent annotation,
         final TypeElement eventTypeElement,
@@ -467,10 +370,6 @@ public final class InjectEventProcessor extends AbstractProcessor {
         }
     }
 
-    /**
-     * Resolves the event class specified in {@link InjectEvent#event()},
-     * handling the {@link MirroredTypeException} that occurs at compile time.
-     */
     private TypeMirror resolveEventType(
         final ExecutableElement method,
         final InjectEvent annotation
@@ -493,9 +392,6 @@ public final class InjectEventProcessor extends AbstractProcessor {
         }
     }
 
-    /**
-     * Generates and writes the companion Mixin class for one injection point.
-     */
     private void generateCompanionMixin(
         final TypeElement mixinClass,
         final ExecutableElement method,
@@ -520,38 +416,25 @@ public final class InjectEventProcessor extends AbstractProcessor {
             return;
         }
 
-        // Register the generated class for the auto-generated mixin config JSON
         final String configFileName = resolveConfigFileName(mixinPackage);
         pendingConfigs.computeIfAbsent(configFileName, k -> new ArrayList<>())
             .add(new MixinConfigEntry(mixinPackage, generatedClassName));
-
-        // Maybe add back in later
-        // processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
-        //     "@InjectEvent generated " + generatedFqn, method);
     }
 
-    // ── Helpers ──────────────────────────────────────────────────────────────
-
-    /**
-     * Writes all pending mixin config JSON files to {@code CLASS_OUTPUT}.
-     * Called once in the final processing round.
-     */
     private void writePendingMixinConfigs() {
-        for (final var entry : pendingConfigs.entrySet()) {
+        for (final Map.Entry<String, List<MixinConfigEntry>> entry : pendingConfigs.entrySet()) {
             writeMixinConfigJson(entry.getKey(), entry.getValue());
         }
     }
 
-    /**
-     * Writes a single mixin config JSON resource file.
-     *
-     * @param fileName the resource filename (e.g. {@code "mixins.testplugin.generated.json"})
-     * @param entries  the generated companion mixin classes to include
-     */
     private void writeMixinConfigJson(
         final String fileName,
         final List<MixinConfigEntry> entries
     ) {
+        if (!emittedMixinConfigs.add(fileName)) {
+            return;
+        }
+
         try {
             final FileObject resource = processingEnv.getFiler()
                 .createResource(StandardLocation.CLASS_OUTPUT, "", fileName);
@@ -561,8 +444,6 @@ public final class InjectEventProcessor extends AbstractProcessor {
             processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
                 "@InjectEvent generated mixin config: " + fileName
                     + " (add to plugin.yml mixins list)");
-        } catch (final FilerException e) {
-            // Resource already exists from a previous incremental build — skip silently
         } catch (final IOException e) {
             processingEnv.getMessager().printMessage(Diagnostic.Kind.ERROR,
                 "@InjectEvent: failed to write mixin config " + fileName + ": " + e.getMessage());
@@ -605,26 +486,14 @@ public final class InjectEventProcessor extends AbstractProcessor {
         processingEnv.getMessager().printMessage(Diagnostic.Kind.ERROR, message, element);
     }
 
-    // ── Data records ────────────────────────────────────────────────────────
-
     private record ParamEntry(String type, String name) {
     }
 
-    /**
-     * A generated companion mixin class entry for the mixin config JSON.
-     *
-     * @param pkg             the package of the generated class
-     * @param simpleClassName the simple class name (e.g. {@code "ServerLevelInjectEvent_testPlugin_onTick"})
-     */
     private record MixinConfigEntry(String pkg, String simpleClassName) {
     }
 
-    /**
-     * Bundles the validated context for a single injection point, avoiding
-     * long parameter lists on code-generation methods.
-     */
     private record InjectionContext(
-        MixinTarget target,
+       MixinTarget target,
         InjectEvent annotation,
         String jvmDescriptor,
         String eventFqn,

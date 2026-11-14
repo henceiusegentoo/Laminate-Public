@@ -6,10 +6,7 @@ import org.bukkit.event.Listener;
 
 import java.util.logging.Logger;
 
-/**
- * Demonstrates consuming a Bukkit event bridged from an NMS injection point
- * via {@code @InjectEvent}.
- */
+/** Consumes the bridged tick event. */
 public final class TickListener implements Listener {
 
     private static final Logger LOGGER = Logger.getLogger(TickListener.class.getName());

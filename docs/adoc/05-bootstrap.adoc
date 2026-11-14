@@ -1,79 +1,148 @@
 // ============================================================
-[[bootstrap-order]]
-== 5. Bootstrap Coordination
+[[bootstrap]]
+== 5. Runtime Bootstrap: The Lazy Gate
 // ============================================================
 
-=== 5.1. `PaperBootstrap`
+`LaminateRuntimeBootstrap` (`laminate-runtime/src/main/java/eu/lschreiber/laminate/runtime/LaminateRuntimeBootstrap.java`)
+is the single entry point that ties plugin discovery, the Quilt/Mixin framework, and
+<<transformer,`LaminateMixinTransformer`>> together. It is invoked from
+`LaminateMain.bootstrapHybridMixins` (see <<launcher>>) immediately after `bundlerLoader` and
+`paperclipLoader` exist, but strictly before Paperclip's `Bundler-Main-Class` has run — so
+strictly before a single `net.minecraft.*` or `io.papermc.*` class has been loaded anywhere in
+the process.
 
-Class:: `io.papermc.paper.PaperBootstrap`
-Source:: `paper-server/src/main/java/io/papermc/paper/PaperBootstrap.java`
+=== 5.1. Why bootstrap is split into two stages
 
-`PaperBootstrap.boot(OptionSet)` is the Paperclip-delegated entry point.
-The critical ordering is:
+A straight, single-call port of the reference fork's `HybridPluginMixinBootstrap` does not work
+in this project's boot order, for a reason specific to how SpongePowered Mixin resolves targets.
 
-[source,java]
-----
-public static void boot(final OptionSet options) {
-    bootstrapHybridMixins(options);          // (1) Laminate — before any Minecraft class
+`Mixins.addConfiguration(...)` and the `MixinEnvironment` phase advance
+(`PREINIT`→`INIT`→`DEFAULT`) resolve every `@Mixin`-annotated class's *target* class
+**eagerly and exactly once**: `MixinInfo.getTargetClass()` calls `ClassInfo.forName(target.name)`,
+which — for any name outside `java.*` — reads raw bytecode via
+`MixinService.getService().getBytecodeProvider().getClassNode(...)`, which in this project
+ultimately calls <<quilt-adapter,`LaminateQuiltLauncher.getClassByteArray`>>. If that lookup
+returns `null` at that exact moment, the mixin is **silently and permanently** never bound to
+its target — there is no retry later, even once the real target class is defined and loaded.
 
-    SharedConstants.tryDetectVersion();      // (2) first Minecraft class load
-    getStartupVersionMessages().forEach(LOGGER::info);
-    Main.main(options);                      // (3) rest of Paper startup
-}
-----
+In the reference fork, this was never a problem: the fork calls its bootstrap from inside
+`PaperBootstrap.boot()`, a hook Paper's own forked source exposes just before
+`SharedConstants.tryDetectVersion()` — late enough that Paper's own classes are already on a
+resolvable classpath. Laminate has no forked Paper source to hook, so its bootstrap has to run
+*earlier*, at the very start of the JVM's life, before Paperclip has downloaded, patched, or
+exposed a single game class anywhere. Calling `Mixins.addConfiguration`/`gotoPhase` at that
+point can never succeed — every mixin's target class would simply fail to resolve. This was
+traced to source and confirmed live during this project's development.
 
-`SharedConstants.tryDetectVersion()` triggers the class loading of core Minecraft classes.
-Any mixin transformation that adds fields to those classes _must_ be applied before this
-line; once a class is loaded, field addition via retransformation is not guaranteed to
-succeed.
+The fix is to split what used to be one synchronous call into two stages:
 
-`bootstrapHybridMixins(OptionSet)` reads the `--plugins`, `--add-plugin`, and
-`--add-plugin-dir` options from the command-line and delegates to
-`LaminateMixinBootstrap.bootstrap(pluginDir, addFiles, addDirs)`.
+Stage A (`bootstrap`, public, called once from `LaminateMain`)::
+Everything that does *not* require target classes to be resolvable: scanning plugin
+directories (<<plugin-scanning,see below>>), reading each hybrid plugin's descriptor, one-time
+Mixin/Quilt framework service initialization (`ensureMixinBootstrap` — service registration
+only, not config registration), wrapping each hybrid plugin's jar in its own pinned
+`URLClassLoader`, and queuing the plugin (not yet registering its mixin configs) for Stage B.
+`laminate-core-mixins`' own always-on config (`laminate-core.mixins.json`, see
+<<bridge-and-core-mixins>>) is queued unconditionally here too — every boot, regardless of
+whether any hybrid plugin was discovered, since it ships as part of Laminate's own merged bundle
+jar rather than being tied to a plugin jar. Because there is therefore always at least one
+config for Stage B to register, Stage A unconditionally installs a
+<<transformer,`LaminateMixinTransformer`>> "gate" via `Instrumentation.addTransformer` — but at
+this point it is not yet backed by a real `IMixinTransformer`; its only job until Stage B runs
+is to detect the right moment to trigger it.
 
-=== 5.2. `PluginInitializerManager`
+Stage B (`transformerForGameLoad`/`triggerStageB`, private, triggered lazily)::
+Runs exactly once, synchronously, the first time a class load is recognized as coming from the
+real game loader (<<detecting-the-game-loader,see below>>) — pins that loader
+(<<quilt-adapter,`LaminateQuiltLauncher.pinGameLoaderIfAbsent`>>, so `getClassByteArray` lookups
+can actually find `net.minecraft.*`/`io.papermc.*` bytecode), registers
+`laminate-core-mixins`' config unconditionally, then — for each queued hybrid plugin, with
+per-plugin failure isolation — registers its mixin configs, advances the Mixin environment's
+phases, obtains the real `IMixinTransformer` from `MixinServiceKnot`, and publishes the outcome
+via `LaminateBridge` (<<bridge-and-core-mixins,see below>>).
 
-Class:: `io.papermc.paper.plugin.PluginInitializerManager`
-Source:: `paper-server/src/main/java/io/papermc/paper/plugin/PluginInitializerManager.java`
+By construction, all of Stage B runs *before* the class whose load triggered it is actually
+*defined* by the JVM (`ClassFileTransformer.transform` always runs before class definition), so
+the transformer Stage B just built is used to transform that very triggering class too, before
+`transform` even returns — nothing is skipped, and the timing invariant from <<architecture>> is
+satisfied by construction rather than by a hook Laminate does not control.
 
-`PluginInitializerManager.load(OptionSet)` is the second point where bootstrap is invoked
-(idempotency means the second call is essentially a no-op, returning the cached failure
-set from the first call).
-Its job at this stage is:
+=== 5.2. Detecting the game loader
 
-. Call `LaminateMixinBootstrap.bootstrap(...)` with the same paths.
-. Call `EntrypointUtil.registerProvidersFromSource(...)` for the plugin directory and all
-  `--add-plugin`/`--add-plugin-dir` inputs.
-. Remove from all provider storages any provider whose lower-case name appears in
-  `failedHybridPlugins`.
-. Partition the remaining providers into three categories and log counts:
-+
-[cols="1,2"]
-|===
-|Category |Predicate
+[[detecting-the-game-loader]]
+`LaminateMixinTransformer.transform` is called by the JVM for every class load and passes the
+class's actual *defining* `ClassLoader` on every single call — reliably, not
+timing/threading-dependent. Stage B's trigger check, `isGameLoaderCandidate`, treats a loader as
+the real game loader if all of the following hold:
 
-|Laminate plugins
-|`provider instanceof LaminatePluginProvider`
+* it is an instance of `java.net.URLClassLoader`;
+* it is not `bundlerLoader` (an identity check against a loader reference captured once during
+  Stage A);
+* it is not `paperclipLoader` (same mechanism); and
+* it is not one of the pinned per-plugin resource loaders Stage A created.
 
-|Paper plugins
-|`provider instanceof PaperPluginParent.PaperServerPluginProvider`
+The `URLClassLoader` type check is load-bearing, not incidental. An earlier version of this
+check only excluded loaders by identity, on the assumption nothing else could plausibly load a
+class in this window. Live testing falsified that: the very first eligible `transform` call
+after the gate installs can have a JDK-internal loader as its defining loader (for example,
+`jdk.internal.loader.ClassLoaders$PlatformClassLoader`, for a service-provider class the JDK
+itself loads lazily) — trivially "distinct" from all the excluded identities, but obviously not
+Paperclip's `serverLoader`, and triggering Stage B on it reproduced the exact
+premature-resolution bug this whole design exists to avoid. None of the JDK's own built-in
+loaders (platform, boot, application) are `URLClassLoader` instances on JDK 9+, and Paperclip is
+confirmed (by reading its source) to construct `serverLoader` as a plain `URLClassLoader` — so
+requiring the type rules out every JDK-internal loader in one shot, without having to enumerate
+them by name.
 
-|Bukkit/Legacy plugins
-|`provider instanceof SpigotPluginProvider` (but not `LaminatePluginProvider`)
-|===
+=== 5.3. Idempotency and thread safety
 
-`LaminatePluginProvider` is checked first because it is a subtype of `SpigotPluginProvider`.
+Stage A caches its result after the first call; every subsequent call, regardless of arguments,
+returns the cached result without re-scanning or touching the Mixin/Quilt machinery again. Stage
+B has its own, separate one-shot guard, since it is triggered independently and later, from a
+different call site (`LaminateMixinTransformer.transform`) than Stage A.
 
-=== 5.3. `PluginInitializerManager.reload()`
+`triggerStageB` is `synchronized` and re-checks its own guard after acquiring the lock: if two
+threads race to trigger Stage B concurrently, only one actually runs the registration/phase-advance
+sequence; the other blocks on the monitor, then observes the guard already set and returns
+whatever the first thread produced. The guard is keyed on "attempted", not "succeeded" — if Stage
+B runs but fails to obtain a transformer, it is never re-entered, matching the fork's original
+behavior of giving up rather than retrying.
 
-This method handles `/reload`.
-When any `LaminatePluginProvider` is registered, it emits a prominent warning:
+=== 5.4. Plugin discovery and descriptors
 
-----
-You are reloading while having Laminate hybrid plugins installed.
-Laminate hybrid plugins do NOT support being reloaded.
-Mixin bytecode transformations are permanent for the lifetime of this server process.
-----
+[[plugin-scanning]]
+Stage A collects candidate plugin jars via `PluginJarCollector` (default plugin directory, plus
+any `--add-plugin`/`--add-plugin-dir` entries parsed by `PluginArguments` — see <<launcher>>),
+then hands each jar to `HybridPluginDescriptorReader`. A jar that contains no hybrid descriptor
+is silently treated as an ordinary Bukkit plugin, not an error. A jar whose descriptor exists but
+fails to parse is recorded as a failed hybrid plugin (its name, lower-cased) and excluded from
+Stage B entirely — it is never queued.
 
-This is a _warning_, not a hard block at the `reload` level; the hard block is in
-`ReloadCommand`, which refuses to run `/reload` at all when any hybrid plugin is active.
+Each successfully-read plugin produces a `HybridPluginDescriptor` record: the plugin's name (as
+declared in `plugin.yml`) and the list of Mixin JSON config resource paths it declares. A
+dedicated `URLClassLoader` is created over just that plugin's jar (parented to the current
+thread-context loader), registered with the `LaminateQuiltLauncher`, and kept pinned for the
+lifetime of the process so the Mixin transformer can keep resolving mixin classes and configs
+from it.
+
+=== 5.5. The watchdog
+
+Because Stage B's trigger is a heuristic tied to Paperclip constructing its server classloader as
+a plain `URLClassLoader`, a future Paperclip change could make `isGameLoaderCandidate` return
+`false` forever — the gate transformer would then silently no-op for the rest of the process, no
+hybrid plugin's mixins would ever apply, and the server would otherwise boot and look completely
+normal. Silent inertness is a worse failure mode than a loud one for the one feature this whole
+project exists to deliver, so `bootstrap` always spawns a daemon watchdog thread that sleeps 60
+seconds (chosen generously — a slow first boot doing world generation can easily take that long
+before ticking starts) and then logs a loud `ERROR` if Stage B still has not produced a
+transformer, explaining exactly what to check.
+
+=== 5.6. Retransformation safety net
+
+After Stage B obtains a transformer, it scans `Instrumentation.getAllLoadedClasses()` for any
+already-loaded `net.minecraft.*`/`io.papermc.*` class and retransforms it individually. In
+practice this should always find nothing — Stage B runs strictly before the class that triggered
+it is even defined — but the safety net is kept anyway, matching the fork's own defensive
+posture, and retransforming classes individually means a method-only mixin can still succeed even
+when a field-adding mixin on some other, unrelated already-loaded class cannot (field addition
+requires a JVM class-redefinition capability that plain retransformation does not have).

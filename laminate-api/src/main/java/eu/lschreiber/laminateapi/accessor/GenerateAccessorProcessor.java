@@ -23,23 +23,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
-/**
- * Annotation processor that generates typed accessor interfaces for
- * {@link GenerateAccessor}-annotated mixin methods.
- *
- * <h2>Generated artefacts</h2>
- * <p>For each {@code @Mixin} class containing at least one {@code @GenerateAccessor}
- * method, a single accessor interface is emitted in a sibling {@code .accessor}
- * package (not inside the mixin package itself, which SpongePowered Mixin
- * forbids loading directly).</p>
- *
- * <p>The interface provides:</p>
- * <ul>
- *   <li>One typed method per {@code @GenerateAccessor} method.</li>
- *   <li>A static {@code of(Object)} factory backed by
- *       {@link LaminateAccessors#create}.</li>
- * </ul>
- */
+/** Generates typed accessor interfaces for {@link GenerateAccessor} methods. */
 @SupportedAnnotationTypes("eu.lschreiber.laminateapi.accessor.GenerateAccessor")
 @SupportedSourceVersion(SourceVersion.RELEASE_21)
 public final class GenerateAccessorProcessor extends AbstractProcessor {
@@ -60,12 +44,6 @@ public final class GenerateAccessorProcessor extends AbstractProcessor {
         return true;
     }
 
-    // ── Collection ──────────────────────────────────────────────────────────
-
-    /**
-     * Iterates all {@code @GenerateAccessor}-annotated methods, validates them,
-     * and groups them by their enclosing mixin class.
-     */
     private void collectAnnotatedMethods(final RoundEnvironment roundEnv,
                                          final Map<TypeElement, List<AccessorEntry>> entriesByMixin,
                                          final Map<TypeElement, MixinTarget> targetByMixin) {
@@ -98,12 +76,6 @@ public final class GenerateAccessorProcessor extends AbstractProcessor {
         }
     }
 
-    /**
-     * Determines the accessor method name: either the explicit
-     * {@link GenerateAccessor#name()} or the annotated method's own name.
-     *
-     * @return the validated name, or {@code null} if invalid
-     */
     private String resolveCleanName(final ExecutableElement method,
                                     final GenerateAccessor annotation) {
         final String annotatedName = annotation.name();
@@ -121,10 +93,6 @@ public final class GenerateAccessorProcessor extends AbstractProcessor {
         return trimmed;
     }
 
-    /**
-     * Collects erased parameter types with positional names ({@code p0}, {@code p1}, …)
-     * so the generated interface compiles regardless of {@code -parameters}.
-     */
     private List<ParamEntry> collectParameters(final ExecutableElement method) {
         final List<? extends VariableElement> params = method.getParameters();
         final List<ParamEntry> result = new ArrayList<>(params.size());
@@ -136,9 +104,6 @@ public final class GenerateAccessorProcessor extends AbstractProcessor {
         return result;
     }
 
-    /**
-     * Resolves the {@code @Mixin} target for the given class, caching the result.
-     */
     private void resolveMixinTargetOnce(final TypeElement mixinClass,
                                         final Map<TypeElement, MixinTarget> targetByMixin) {
         if (targetByMixin.containsKey(mixinClass)) {
@@ -158,15 +123,10 @@ public final class GenerateAccessorProcessor extends AbstractProcessor {
         targetByMixin.put(mixinClass, target);
     }
 
-    // ── Code generation ─────────────────────────────────────────────────────
-
-    /**
-     * Emits one accessor interface per mixin class.
-     */
     private void generateAccessorInterfaces(final Map<TypeElement, List<AccessorEntry>> entriesByMixin,
                                             final Map<TypeElement, MixinTarget> targetByMixin) {
 
-        for (final var entry : entriesByMixin.entrySet()) {
+        for (final Map.Entry<TypeElement, List<AccessorEntry>> entry : entriesByMixin.entrySet()) {
             final TypeElement mixinClass = entry.getKey();
             final List<AccessorEntry> entries = entry.getValue();
             final MixinTarget target = targetByMixin.get(mixinClass);
@@ -185,9 +145,6 @@ public final class GenerateAccessorProcessor extends AbstractProcessor {
         }
     }
 
-    /**
-     * Creates the source file and writes the accessor interface.
-     */
     private void writeAccessorFile(final String fqn,
                                    final TypeElement originatingElement,
                                    final String pkg,
@@ -206,9 +163,6 @@ public final class GenerateAccessorProcessor extends AbstractProcessor {
         }
     }
 
-    /**
-     * Writes the accessor interface source code to the given writer.
-     */
     private static void writeAccessorInterface(final Writer writer,
                                                final String pkg,
                                                final String className,
@@ -225,14 +179,11 @@ public final class GenerateAccessorProcessor extends AbstractProcessor {
         writer.write("public interface " + className + " {\n\n");
 
         writeMethodDeclarations(writer, entries);
-        writeMappingsArray(writer, entries, className);
+        writer.write(buildMappingsFactoryMethod(entries, className));
 
         writer.write("}\n");
     }
 
-    /**
-     * Writes abstract method declarations for each accessor entry.
-     */
     private static void writeMethodDeclarations(final Writer writer,
                                                 final List<AccessorEntry> entries) throws IOException {
         for (final AccessorEntry entry : entries) {
@@ -244,12 +195,8 @@ public final class GenerateAccessorProcessor extends AbstractProcessor {
         }
     }
 
-    /**
-     * Writes the static {@code of(Object)} factory method with its method-mapping array.
-     */
-    private static void writeMappingsArray(final Writer writer,
-                                           final List<AccessorEntry> entries,
-                                           final String className) throws IOException {
+    private static String buildMappingsFactoryMethod(final List<AccessorEntry> entries,
+                                                     final String className) {
         final StringBuilder mappings = new StringBuilder("new String[]{");
         for (int i = 0; i < entries.size(); i++) {
             if (i > 0) {
@@ -261,27 +208,17 @@ public final class GenerateAccessorProcessor extends AbstractProcessor {
         }
         mappings.append('}');
 
-        writer.write("    static " + className + " of(Object target) {\n");
-        writer.write("        return LaminateAccessors.create(" + className
-                + ".class, target, " + mappings + ");\n");
-        writer.write("    }\n");
+        return "    static " + className + " of(Object target) {\n"
+                + "        return LaminateAccessors.create(" + className
+                + ".class, target, " + mappings + ");\n"
+                + "    }\n\n";
     }
-
-    // ── Helpers ──────────────────────────────────────────────────────────────
 
     private String packageName(final TypeElement element) {
         return processingEnv.getElementUtils()
                 .getPackageOf(element).getQualifiedName().toString();
     }
 
-    /**
-     * Derives the accessor output package from the mixin package.
-     *
-     * <p>The accessor is placed in a sibling {@code accessor} package — i.e. the
-     * parent of the mixin package with {@code .accessor} appended.</p>
-     *
-     * <p>Example: {@code com.example.mixins} → {@code com.example.accessor}</p>
-     */
     static String deriveAccessorPackage(final String mixinPackage) {
         if (mixinPackage.isEmpty()) {
             return "accessor";
@@ -292,8 +229,6 @@ public final class GenerateAccessorProcessor extends AbstractProcessor {
         }
         return mixinPackage.substring(0, lastDot) + ".accessor";
     }
-
-    // ── Data records ────────────────────────────────────────────────────────
 
     private record ParamEntry(String type, String name) {
     }

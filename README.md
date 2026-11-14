@@ -1,32 +1,20 @@
-# Laminate
+# laminate-standalone
 
-Laminate is a [Paper](https://papermc.io/) fork for Minecraft 1.21.11 that enables **hybrid
-plugins**: standard Bukkit/Paper plugins that can apply
-[SpongePowered Mixin](https://github.com/SpongePowered/Mixin) bytecode transformations to the
-server at runtime.
+Laminate is a standalone launcher/agent that wraps an unmodified official Paper server jar to enable
+"hybrid plugins" (Bukkit plugins carrying SpongePowered Mixin transforms), without forking Paper's
+sources. It supersedes the [`Laminate`](https://github.com/henceiusegentoo/Laminate) Paper fork by
+downloading and bundling an official Paper build at build time instead of maintaining a patched
+Paper checkout.
 
-## What makes Laminate special
+**Status:** the full pipeline works and is live-verified end to end. `laminateServerJar` bundles a
+downloaded, unmodified Paper build with Laminate's launcher, agent, and mixin runtime into a single
+jar; hybrid plugins (Bukkit plugins carrying SpongePowered Mixin transforms) load and fire correctly
+via a two-stage bootstrap that installs the class-file transformer before any Minecraft class loads;
+Laminate's own always-on core mixins reproduce the old fork's Paper-internal UX behaviors (failed
+hybrid plugin culling, `/reload` blocking, a "Laminate Plugins" line in `/plugins`) without patching
+Paper's source. See `docs/adoc/index.adoc` for the full internal-architecture writeup, and
+`docs/adoc/13-hybrid-plugin-dev.adoc` for a step-by-step guide to writing a hybrid plugin.
 
-Laminate lets you write plugins that use mixins for deep, low-level server modifications without
-needing a separate mod loader. You get full access to NMS internals (injecting into private
-methods, adding fields to server classes, intercepting return values) while keeping the familiar
-Paper plugin lifecycle your plugins already use.
-
-## Running the Server
-
-```bash
-java -jar laminate-server-1.21.11-R0.1-SNAPSHOT.jar nogui
-```
-
-No extra flags or configuration needed. All standard Paper/CraftBukkit arguments are supported.
-
-## Further Reading
-
-For detailed documentation see the [Laminate Wiki](https://github.com/henceiusegentoo/Laminate-Public/wiki):
-
-- [Writing a Hybrid Plugin](https://github.com/henceiusegentoo/Laminate-Public/wiki/Writing-a-Hybrid-Plugin): full plugin development guide
-- [Architecture](https://github.com/henceiusegentoo/Laminate-Public/wiki/Architecture): bootstrap sequence, mixin pipeline, and module structure
-- [Building from Source](https://github.com/henceiusegentoo/Laminate-Public/wiki/Building-from-Source): build steps, Gradle tasks, and the test-plugin module
-- [Troubleshooting](https://github.com/henceiusegentoo/Laminate-Public/wiki/Troubleshooting): common errors and fixes
-
-> Comprehensive technical docs [here](/docs/adoc/index.adoc)
+Pinned to Paper `26.2` (Minecraft's newer `26.x` calendar-style versioning), which requires Java 25
+at both compile and run time; the Gradle toolchain is set accordingly. CI/release automation is not
+yet set up.

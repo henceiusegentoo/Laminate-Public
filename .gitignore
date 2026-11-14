@@ -42,10 +42,15 @@ out/
 run/
 logs/
 
+# quilt-loader writes this to the working directory whenever MixinBootstrap.init() runs for real
+# (e.g. LaminateRuntimeBootstrapTest's live Quilt/Mixin registration test)
+quiltloader.log
+
 !gradle/wrapper/gradle-wrapper.jar
 
-test-plugin.settings.gradle.kts
-paper-generator.settings.gradle.kts
+# Laminate runtime data dir
+/laminate/
 
-# Don't track patched vanilla submodules
-paper-server/src/minecraft/
+# Python bytecode cache (docs/diagrams-src/generate_diagrams.py)
+__pycache__/
+*.pyc

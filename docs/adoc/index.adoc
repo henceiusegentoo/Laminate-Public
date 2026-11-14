@@ -1,18 +1,29 @@
-= Laminate Internals
+= Laminate Standalone Internals
 :toc: left
 :toclevels: 4
 :sectanchors:
 :sectlinks:
 :source-highlighter: rouge
 
-This document describes the internal design and implementation of Laminate, a Paper 1.21.11
-fork that adds first-class support for _hybrid plugins_: standard Bukkit/Paper plugins that
-may also register SpongePowered Mixin bytecode transformations against the live server
-without requiring operators to supply manual JVM flags or install a separate mod loader.
+This document describes the internal design and implementation of `laminate-standalone`, a
+from-scratch launcher and mixin runtime that adds first-class support for _hybrid plugins_ —
+standard Bukkit/Paper plugins that may also register SpongePowered Mixin bytecode
+transformations against the live server — on top of an official, completely unmodified Paper
+build, without requiring operators to supply manual JVM flags or install a separate mod loader.
 
-Every question about how the server starts, how mixins are registered, how the plugin
-provider system recognises hybrid plugins, and how `laminate-api` tools work for plugin
-authors should be answerable from the sections that follow.
+Unlike the project this one replaces (a full source fork of Paper, frozen and preserved as a
+historical proof of concept), `laminate-standalone` does not patch or fork a single line of
+Paper's own source. It treats an official "paperclip" server jar as a build input: downloaded
+and sha256-verified at *Gradle build time*, then merged with this project's own launcher, mixin
+runtime, and always-on core mixins into one bootable `laminate-server-<mcversion>.jar`. Updating
+to a newer Paper release is, in the common case, bumping one property in `gradle.properties` and
+rebuilding — there is no patch stack to rebase and no merge conflicts to resolve by hand.
+
+Every question about how the server starts, how the mixin runtime is bootstrapped without a
+forked `PaperBootstrap` hook to call into, how Paper-internal UX behaviors (failed-plugin
+culling, `/reload` blocking, `/plugins` categorization) are reproduced as ordinary mixins instead
+of source edits, and how `laminate-api` tools work for hybrid plugin authors should be answerable
+from the sections that follow.
 
 include::01-how-to-read.adoc[]
 
@@ -24,20 +35,18 @@ include::04-agent.adoc[]
 
 include::05-bootstrap.adoc[]
 
-include::06-mixin-subsystem.adoc[]
+include::06-quilt-adapter.adoc[]
 
-include::07-quilt-adapter.adoc[]
+include::07-transformer.adoc[]
 
-include::08-transformer.adoc[]
+include::08-bridge-and-core-mixins.adoc[]
 
-include::09-plugin-provider.adoc[]
+include::09-laminate-api.adoc[]
 
-include::10-laminate-api.adoc[]
+include::10-test-plugin.adoc[]
 
-include::11-test-plugin.adoc[]
+include::11-build-and-bundling.adoc[]
 
-include::12-build.adoc[]
+include::12-operations.adoc[]
 
-include::13-operations.adoc[]
-
-include::14-hybrid-plugin-dev.adoc[]
+include::13-hybrid-plugin-dev.adoc[]

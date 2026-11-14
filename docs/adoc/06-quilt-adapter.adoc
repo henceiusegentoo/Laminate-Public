@@ -1,0 +1,93 @@
+// ============================================================
+[[quilt-adapter]]
+== 6. The Quilt/Knot Adapter (`LaminateQuiltLauncher`)
+// ============================================================
+
+SpongePowered Mixin's public API is built on top of a pluggable *Mixin service*; Laminate uses
+Quilt-loader's Knot implementation of that service (`MixinServiceKnot`), which in turn expects a
+`org.quiltmc.loader.impl.launch.common.QuiltLauncherBase` implementation to answer questions like
+"what does this class's bytecode look like" and "what class loader should mixin classes be
+defined in." `LaminateQuiltLauncher`
+(`laminate-runtime/src/main/java/eu/lschreiber/laminate/runtime/LaminateQuiltLauncher.java`) is
+that implementation — a faithful port of the reference fork's `PaperQuiltLauncher`, with one real
+architectural difference described in <<pinned-game-loader>>.
+
+It is constructed exactly once, from `LaminateRuntimeBootstrap.ensureMixinBootstrap` during Stage
+A (see <<bootstrap>>); its constructor calls the `QuiltLauncherBase` superclass constructor, which
+registers the instance as the process-wide launcher `MixinServiceKnot` looks up.
+
+=== 6.1. Departures from Quilt's own Knot
+
+`LaminateQuiltLauncher` implements the same interface Knot does, but several methods are
+deliberately simplified because Laminate does not need Knot's full mod-loading feature set:
+
+* *Class bytes* — Knot reads raw bytes through its own `KnotClassDelegate`; this launcher reads
+  them from whichever of a small, fixed set of loaders actually has the resource (see
+  <<resource-search-order>>).
+* *`isClassLoaded`* — always returns `false`, to avoid `MixinTargetAlreadyLoadedException` during
+  config preparation. Real already-loaded classes are instead handled by
+  `LaminateRuntimeBootstrap`'s retransformation safety net (<<bootstrap>>), not by this method
+  honestly reporting load state.
+* *Classpath* — Knot dynamically extends its own class loader's classpath as mods are discovered;
+  this launcher has nothing analogous to extend (Laminate's classpath shape is fixed by
+  `LaminateMain` before any of this runs) and instead just tracks registered plugin class loaders
+  in a list.
+* A long list of `QuiltLauncherBase` methods relating to Quilt's transform cache, hidden classes,
+  plugin package isolation, and parent-URL hiding are all no-ops here — Laminate does not use any
+  of those Quilt-loader features.
+
+=== 6.2. Pinned game loader
+
+[[pinned-game-loader]]
+This is the one place where this project's classloader layout genuinely forces a different design
+from the reference fork, not just a simplification.
+
+In the fork, `getClass().getClassLoader()` — this launcher's own defining loader — *is* the same
+loader that defines Paper's own classes, because the fork is a single, flat classpath with no
+classloader boundary between Laminate's own code and Paper's. `classLoader.getResourceAsStream(
+"net/minecraft/.../Foo.class")` just works there.
+
+In this standalone build, `LaminateQuiltLauncher` is loaded by `bundlerLoader` (see
+<<launcher,LaminateMain's classloader construction>>), which is the *parent* of `serverLoader`
+(constructed later, by Paperclip, and which actually defines Paper's own classes) — and a parent
+classloader can never see a child's private classpath. `classLoader.getResourceAsStream(...)` for
+a `net.minecraft.*` resource, called on `bundlerLoader`, returns `null`.
+
+The fix relies on a fact established in <<bootstrap>>: `LaminateMixinTransformer.transform`
+receives the *actual defining* `ClassLoader` of every class as a parameter on every call. Stage B
+of `LaminateRuntimeBootstrap`'s lazy gate, the first time it recognizes that loader as the real
+game loader, calls `LaminateQuiltLauncher.pinGameLoaderIfAbsent(loader)` — in practice, pinning
+Paperclip's own `serverLoader`. This is a first-write-wins operation backed by an
+`AtomicReference`: the first successful compare-and-set wins even under a race between threads;
+every read after that is a single plain volatile read, cheap enough to perform unconditionally on
+the hot class-transform path.
+
+Once pinned, resource and class-byte lookups in this class search the pinned loader *before*
+`classLoader` (`bundlerLoader`) itself, since it is specifically Paper's own classes that these
+lookups need to resolve most often, and `bundlerLoader` will almost never directly contain a
+`net.minecraft.*` resource on its own classpath.
+
+=== 6.3. Resource search order
+
+[[resource-search-order]]
+`getClassByteArray`, `getResourceAsStream`, and `getResourceURL` all funnel through the same
+search order (`findResource`/`findResourceUrl`):
+
+. the pinned game loader, if one has been recorded and it differs from `classLoader`;
+. `classLoader` (`bundlerLoader` itself — where `laminate-runtime`, `laminate-bridge`,
+  `laminate-api`, quilt-loader, sponge-mixin, mixinextras, and ASM all live);
+. the thread-context class loader, if it differs from both of the above;
+. every registered per-plugin `URLClassLoader`, in registration order.
+
+This order is what lets a single `LaminateQuiltLauncher` instance resolve three completely
+different kinds of resource correctly: vanilla Paper bytecode (via the pinned loader), Laminate's
+own and the mixin framework's own classes (via `classLoader`), and hybrid plugins' own `@Mixin`
+classes and mixin-config JSON (via the registered plugin loaders).
+
+=== 6.4. Thread safety
+
+`pluginClassLoaders` is a `CopyOnWriteArrayList`: writes only happen rarely, during Stage A
+bootstrap, while reads happen constantly from whatever thread the JVM is loading classes on. The
+pinned game loader, as described above, is published through a single `AtomicReference` rather
+than any form of incidental happens-before ordering, precisely because reads of it happen from a
+different thread than the write in the general case.

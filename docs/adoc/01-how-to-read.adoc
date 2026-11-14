@@ -1,18 +1,36 @@
 == 1. How to read this document
 
-Sections 2 through 6 cover the server-startup and mixin-bootstrap path in execution order:
-architecture overview, self-launching entry point, Java agent, bootstrap coordination, and
-the full mixin bootstrap subsystem.
+This document describes the internal design of `laminate-standalone`: a from-scratch launcher
+that bundles an *unmodified* official Paper server jar (downloaded and merged at Gradle build
+time, not patched at the source level) and adds hybrid-plugin mixin support on top of it purely
+through classloader tricks, a Java agent, and SpongePowered Mixin. Unlike the older, fully
+forked Laminate project, there is no patched Paper source anywhere in this repository.
 
-Sections 7 and 8 cover the Quilt/Knot adapter (`PaperQuiltLauncher`) and the JVM
-class-file transformer (`PaperMixinClassFileTransformer`).
+The thirteen chapters, in order:
 
-Section 9 covers the plugin provider system.
-Section 10 covers the `laminate-api` module (annotation processors and runtime bridges).
-Section 11 is a walkthrough of the reference hybrid plugin (`test-plugin`).
-Section 12 covers build and distribution.
-Section 13 covers operator and author guidance.
-Section 14 is a step-by-step guide to developing your own hybrid plugin.
+. How to read this document
+. Architecture Overview
+. The Launcher (`LaminateMain`)
+. The Java Agent (`LaminateAgent`)
+. Runtime Bootstrap: The Lazy Gate
+. The Quilt/Knot Adapter (`LaminateQuiltLauncher`)
+. The Class-File Transformer (`LaminateMixinTransformer`)
+. The Cross-Classloader Bridge and Core Mixins
+. The `laminate-api` Module
+. Walkthrough: `test-plugin`
+. Build-Time Paper Bundling
+. Operator and Author Guidance
+. Developing a Hybrid Plugin
+
+Sections 2 through 7 cover the server-startup and mixin-bootstrap path in roughly execution
+order: architecture overview, the self-relaunching entry point, the Java agent, the two-stage
+("lazy gate") runtime bootstrap, the Quilt/Knot launcher adapter, and the JVM class-file
+transformer that drives the whole thing. Section 8 covers the cross-classloader bridge
+(`LaminateBridge`) and the always-on core mixins woven into vanilla Paper itself. Section 9
+covers the `laminate-api` module (annotation processors and runtime bridges for hybrid plugin
+authors). Section 10 is a walkthrough of the reference hybrid plugin (`test-plugin`). Section 11
+covers build-time Paper bundling and distribution. Section 12 covers operator and author
+guidance. Section 13 is a step-by-step guide to developing your own hybrid plugin.
 
 All class references use their simple name where unambiguous; fully-qualified names are given
 the first time a class is introduced. Source paths are relative to the repository root.

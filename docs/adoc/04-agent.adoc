@@ -1,48 +1,86 @@
 // ============================================================
 [[agent]]
-== 4. Java Agent
+== 4. The Java Agent (`LaminateAgent`)
 // ============================================================
 
-Class:: `io.papermc.paper.mixin.PaperMixinAgent`
-Source:: `paper-server/src/main/java/io/papermc/paper/mixin/PaperMixinAgent.java`
+Class:: `eu.lschreiber.laminate.agent.LaminateAgent`
+Source:: `laminate-launcher/src/main/java/eu/lschreiber/laminate/agent/LaminateAgent.java`
 
 === 4.1. Purpose
 
-`PaperMixinAgent` is intentionally minimal.
-Its only job is to accept the JVM's `Instrumentation` instance from the JVM launcher
-protocol and make it available to the rest of the bootstrap chain.
+`LaminateAgent` is intentionally minimal. Its only job is to capture the JVM's
+`java.lang.instrument.Instrumentation` instance — obtainable *only* through the Java agent
+protocol — and make it available, across classloaders, to the rest of the boot sequence via a
+JVM-global system property.
 
-=== 4.2. `premain` / `agentmain`
+=== 4.2. Why an agent is required at all
 
-[source,java]
-----
-public static void premain(final String args, final Instrumentation inst) {
-    System.setProperty(LAUNCHER_SIGNAL_PROP, "true");
-    System.getProperties().put(INSTRUMENTATION_KEY, inst);
-}
+`Instrumentation.addTransformer(...)` (used by `LaminateRuntimeBootstrap` to install
+`LaminateMixinTransformer` — <<bootstrap,Chapter 5>>) requires an `Instrumentation` instance, and
+the only supported way to obtain one is for the JVM to hand it to a `premain`/`agentmain` method
+on class load. There is no other public API to acquire it. Additionally, retransforming
+already-loaded classes (`Instrumentation.retransformClasses`, used as a safety net in Stage B)
+requires the `Can-Retransform-Classes: true` manifest attribute, which only takes effect for a
+jar actually loaded as a `-javaagent`.
 
-public static void agentmain(final String args, final Instrumentation inst) {
-    premain(args, inst);
-}
-----
-
-`LAUNCHER_SIGNAL_PROP = "laminate.agent.loaded"` — signals `LaminateLauncher` that this
-JVM is correctly configured.
-
-`INSTRUMENTATION_KEY = "paper.mixin.instrumentation"` — the `Instrumentation` object is
-stored in `System.getProperties()` (a JVM-global `Hashtable` that is reachable across all
-class loaders) so that `HybridPluginMixinBootstrap` can retrieve it later without any
-shared static reference.
-
-=== 4.3. `getInstrumentation()`
+=== 4.3. `premain` / `agentmain`
 
 [source,java]
 ----
-static Instrumentation getInstrumentation() {
-    final Object obj = System.getProperties().get(INSTRUMENTATION_KEY);
-    return (obj instanceof Instrumentation inst) ? inst : null;
+public static void premain(String agentArgs, Instrumentation inst) {
+    System.getProperties().put(INSTRUMENTATION_PROPERTY, inst);
+    System.setProperty(AGENT_LOADED_PROPERTY, "true");
+}
+
+public static void agentmain(String agentArgs, Instrumentation inst) {
+    premain(agentArgs, inst);   // identical logic for both entry points
 }
 ----
 
-Returns `null` if the agent was never loaded; `HybridPluginMixinBootstrap` checks for
-this case and logs a clear warning rather than crashing.
+`INSTRUMENTATION_PROPERTY = "laminate.instrumentation"` — the `Instrumentation` *object itself*
+(not a `String`) is stashed via `System.getProperties().put(...)`, since
+`System.setProperty(String, String)` only accepts `String` values but `System.getProperties()`
+returns the live, JVM-global `Hashtable` directly, reachable from any classloader.
+
+`AGENT_LOADED_PROPERTY = "laminate.agent.loaded"` is set to the literal string `"true"` — this is
+the same property key `LaminateMain` reads to decide whether to relaunch (<<launcher,Chapter 3,
+section 3.2>>).
+
+=== 4.4. Avoiding an infinite relaunch loop
+
+`LaminateMain` detects "is the agent already loaded on this JVM?" purely by checking whether
+`System.getProperty("laminate.agent.loaded")` equals `"true"`. Since `premain` always runs before
+`main()` on any JVM started with `-javaagent:<this jar>`, and `RelaunchHandler.relaunch` always
+adds exactly that flag when spawning the child, the child JVM's very first `LaminateMain.main()`
+call already observes the property as `"true"` and proceeds straight to bundler delegation instead
+of relaunching again — one relaunch, never more.
+
+This is also why the jar's manifest deliberately omits `Launcher-Agent-Class` (a JDK 9+ attribute
+that would make the `java` launcher auto-load this jar as an agent via `agentmain` on *every*
+`java -jar` invocation, including the very first, flag-less one). `Launcher-Agent-Class` cannot
+supply additional JVM flags — if it were set, the agent-loaded check would be satisfied
+immediately, permanently skipping `RelaunchHandler`'s self-relaunch, which is the only mechanism
+that actually appends the required `--add-opens` flags. Explicit `-javaagent:self`, added only by
+the relaunch itself, is the sole supported agent-loading path for this jar; `agentmain` exists for
+API completeness (the Attach API) but is not reachable in the ordinary `java -jar` flow.
+
+=== 4.5. `getInstrumentation()`
+
+[source,java]
+----
+public static Instrumentation getInstrumentation() {
+    Object stashed = System.getProperties().get(INSTRUMENTATION_PROPERTY);
+    if (!(stashed instanceof Instrumentation inst)) {
+        throw new IllegalStateException(
+                "No Instrumentation available: LaminateAgent has not been loaded as a Java agent ...");
+    }
+    return inst;
+}
+----
+
+Unlike returning `null` for "not loaded," this throws `IllegalStateException` — acceptable because
+`LaminateMain` only ever calls it after already confirming `laminate.agent.loaded == "true"`
+(<<launcher,Chapter 3, section 3.2>>), so in practice this should never throw once the relaunch
+protocol has run. `LaminateRuntimeBootstrap`'s own Stage A separately tolerates a `null`
+`Instrumentation` reference being passed down to it (logging a warning rather than crashing) for
+callers that construct it directly, e.g. in tests.

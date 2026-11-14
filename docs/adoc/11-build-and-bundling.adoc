@@ -1,0 +1,329 @@
+// ============================================================
+[[build]]
+== 11. Build-Time Paper Bundling
+// ============================================================
+
+This is the chapter with no real equivalent in the reference fork's own
+documentation, because it describes a fundamentally different approach. The
+old fork *was* Paper's own forked source tree: updating to a newer Paper
+release meant re-applying a whole patch stack against a new upstream commit.
+`laminate-standalone` instead treats an official, completely unmodified Paper
+"paperclip" server jar as a build input: it is downloaded, sha256-verified,
+and merged with this project's own compiled classes and runtime dependencies
+into one bootable jar, entirely at Gradle build time. Nothing about Paper's
+own source is patched, forked, or recompiled.
+
+=== 11.1. Two properties control the Paper version
+
+`gradle.properties` at the repository root:
+
+[source,properties]
+----
+paperVersion=26.2
+paperDevBundleVersion=26.2.build.112-stable
+laminateVersion=0.1.0-SNAPSHOT
+----
+
+`paperVersion` is read by `DownloadPaperclipTask` to resolve which official
+Paper build to fetch (<<paperclip-resolution,11.2>>), and ultimately determines
+the output file name of the bundled server jar itself,
+`laminate-server-<paperVersion>.jar`.
+
+`paperDevBundleVersion` is a *separate*, developer-supplied property:
+the full Maven artifact version string `laminate-api`'s, `laminate-core-mixins`'
+and `test-plugin`'s `build.gradle.kts` files pass directly, unmodified, to the
+`paper-api`/`paperweight.paperDevBundle(...)` compile dependencies. Earlier
+revisions of this build derived that string automatically from `paperVersion`
+by appending a hardcoded suffix — first `"-R0.1-SNAPSHOT"`, later
+`".build.+"` — but Paper's dev-bundle coordinate scheme has changed shape more
+than once (a plain `<mcVersion>-R0.1-SNAPSHOT` for the classic 1.x line, up
+through `1.21.11`; a `<mcVersion>.build.<n>-<channel>` scheme, e.g.
+`26.1.2.build.74-stable`, introduced alongside Minecraft's newer `26.x`
+calendar-style versioning), and each time it did, the derivation broke the
+build for anyone bumping `paperVersion`. Rather than keep guessing at (and
+re-breaking on) whatever shape PaperMC publishes next, the build simply does
+not try to derive this string at all — check
+https://repo.papermc.io/repository/maven-public/io/papermc/paper/paper-api/
+for the exact currently-published coordinate and set `paperDevBundleVersion`
+to it directly.
+
+Updating to a newer Paper release — the entire point of moving off a forked
+source tree — is therefore, in the common case, two property changes and a
+rebuild, not a single line: bump `paperVersion` (drives the actual bundled
+server jar), and bump `paperDevBundleVersion` to match (drives what
+`laminate-core-mixins`/`test-plugin`/`laminate-api` compile against). There is
+still no patch stack to rebase and no merge conflicts against upstream Paper
+commits to resolve by hand — whatever Paper release `paperVersion` names is
+downloaded fresh, byte-for-byte identical to what PaperMC itself publishes,
+and this project's own mixins and launcher/agent code are layered on top of it
+at merge time, not baked into a forked copy of it.
+
+An optional `paperBuild` Gradle property (not set in `gradle.properties` by
+default, so the build tracks the *latest* published build of `paperVersion`)
+lets a build pin an exact Paper build number instead of always floating to
+latest — see <<paperclip-resolution,11.2>> and <<download-caching,11.3>> for
+how that changes the caching behaviour. This only affects the paperclip
+download (`paperVersion`/`DownloadPaperclipTask`); `paperDevBundleVersion`
+already names an exact build by construction, since the whole point of
+requiring it to be the full coordinate string is that nothing about it floats.
+
+Minecraft/Paper versions on the new `26.x` scheme carry a further requirement
+worth flagging here even though it is independent of either property: they
+require Java 25 at both compile and run time. The toolchain in the root
+`build.gradle.kts` is pinned to match whichever Paper line `paperVersion`
+currently targets — it moved from 21 to 25 alongside the bump to `26.2`, a
+project-wide change with its own tradeoffs, not covered by this chapter.
+
+// ============================================================
+[[paperclip-resolution]]
+=== 11.2. Resolving a paperclip build: the Fill v3 API
+// ============================================================
+
+Resolution logic lives in `buildSrc/src/main/java/eu/lschreiber/laminate/buildsrc/paperclip/PaperclipResolver.java`,
+a plain buildSrc utility class (no Gradle-specific types) returning a
+`PaperclipResolution` record:
+
+[source,java]
+----
+public record PaperclipResolution(
+        String buildNumber,
+        String channel,
+        String downloadUrl,
+        String sha256,
+        String source
+) {
+}
+----
+
+`PaperclipResolver.resolve(paperVersion, paperBuild)` tries PaperMC's current
+*Fill v3* API first:
+
+[source]
+----
+GET https://fill.papermc.io/v3/projects/paper/versions/{version}/builds/{build|latest}
+----
+
+(`{build}` is the pinned `paperBuild` if set, otherwise the literal path
+segment `latest`). From the JSON response it reads the top-level `id` and
+`channel` fields, then `downloads."server:default".checksums.sha256` and
+`downloads."server:default".url`. If that request throws for any reason (network
+failure, non-2xx status), `resolve` falls back to the legacy v2 API:
+
+[source]
+----
+GET https://api.papermc.io/v2/projects/paper/versions/{version}/builds        (only if paperBuild is unset — finds the max build number)
+GET https://api.papermc.io/v2/projects/paper/versions/{version}/builds/{build}
+----
+
+reading `channel`, `downloads.application.{name,sha256}`, and building the
+final download URL as `{buildUrl}/downloads/{name}`. If *both* APIs fail,
+`resolve` throws `IllegalStateException` naming both underlying failures.
+`PaperclipResolver`'s own class javadoc notes that, as of when it was written,
+the legacy v2 API has actually already been sunset by PaperMC and returns HTTP
+410 for every request — the v2 fallback path is kept anyway (per the project's
+own stated build constraints) so it would activate automatically again if Fill
+v3 ever had an outage, rather than being dead code that silently bit-rots.
+
+Both response bodies are parsed with a small hand-rolled, dependency-free JSON
+scanner (brace-balancing substring extraction plus a couple of regexes for
+scalar fields) rather than pulling in a JSON library — the class javadoc
+explains this was a deliberate choice to avoid adding a dependency to the
+buildscript classpath just to read three or four flat, well-documented scalar
+fields out of a small response body. Care is taken to scope key lookups to the
+correct nesting level (e.g. `topLevelKeysOnly` masks out nested-object content
+before searching for the top-level `id`/`channel` keys, and
+`extractTopLevelObjects` is string-escape-aware) specifically so a same-named
+key nested inside a child object, or a digit run inside a timestamp or sha256
+hex string in the v2 `builds` array, can never be mistaken for the field being
+searched for.
+
+// ============================================================
+[[download-caching]]
+=== 11.3. `DownloadPaperclipTask` — verification and caching
+// ============================================================
+
+`buildSrc/.../paperclip/DownloadPaperclipTask.java` is the Gradle task
+wrapping the resolver. It downloads into
+`{module build dir}/paperclip/paperclip-{paperVersion}-{buildNumber}.jar`
+(wired from `laminate-launcher/build.gradle.kts`'s `outputDirectory.set(layout.buildDirectory.dir("paperclip"))`)
+and verifies the download's SHA-256 against the checksum the resolver
+returned before accepting it — a mismatch deletes the partial file and fails
+the build with `GradleException`, rather than silently leaving a
+corrupt/tampered jar in place.
+
+It is a properly incremental Gradle task: `paperVersion`, `paperBuild`, the
+*resolved* build number/channel/checksum, and the output jar are all declared
+`@Input`/`@OutputFile` properties, so Gradle's own up-to-date checking applies
+normally — an unchanged input/output pair is reported `UP-TO-DATE` and
+`@TaskAction run()` does not execute at all.
+
+The interesting part is avoiding an unconditional network round-trip on
+*every* build just to compute those `@Input` values (Gradle must evaluate
+every declared input getter before it can even decide whether the task is
+up to date):
+
+* When `paperBuild` is **pinned** (not tracking `latest`), the pinned build
+  number is by itself sufficient proof nothing changed. `effectiveResolution()`
+  first looks for a small sidecar file written next to the output jar after a
+  previous successful resolution/download
+  (`{outputJar}.resolved.properties`, holding `paperVersion`/`paperBuild`/
+  `buildNumber`/`channel`/`sha256`). If that sidecar matches the currently
+  configured version/build *and* the on-disk jar's own sha256 still matches
+  what the sidecar recorded, the cached values are used directly — **no
+  network call at all**, allowing a fully offline, up-to-date build.
+* When `paperBuild` is **not pinned** (tracking `latest`), there is
+  fundamentally no way to know whether "latest" has moved without asking the
+  API — that network round-trip is unavoidable in this mode and happens on
+  every invocation that includes the task, by design.
+
+`run()` itself re-verifies defensively even when a resolution was satisfied,
+re-checking the on-disk file's sha256 before deciding to skip the download,
+and falls back to a live re-resolution if the sidecar-cached resolution turns
+out to have no usable `downloadUrl` (e.g. the cache was valid but the jar file
+itself had been deleted externally between Gradle's up-to-date check and the
+task action actually running).
+
+// ============================================================
+[[server-jar-merge]]
+=== 11.4. `LaminateServerJarTask` — the merge
+// ============================================================
+
+`buildSrc/.../bundling/LaminateServerJarTask.java` produces the final
+`laminate-server-<paperVersion>.jar`, wired up in `laminate-launcher/build.gradle.kts`.
+It writes three layers into the output jar, **in strict priority order** —
+an earlier layer always wins a path collision against a later one:
+
+[cols="1,3"]
+|===
+|Layer |Contents
+
+|1. `classDirectories`
+|Raw `compileJava` output directories of this project's own first-party
+modules, copied in the given order: `laminate-launcher` itself, plus
+`laminate-runtime`, `laminate-api`, and `laminate-core-mixins` (the latter's
+*processed resources* directory — carrying `laminate-core.mixins.json` — is
+merged alongside its compiled classes, since Sponge Mixin reads that config at
+boot).
+
+|2. `libraryJars`
+|Third-party/inter-module runtime dependency jars this server needs but does
+not author itself: `laminate-launcher`'s own resolved `runtimeClasspath`
+(quilt-loader, sponge-mixin, mixinextras-common, `asm-util` and its
+transitive ASM artifacts, snakeyaml, and `laminate-bridge`'s jar), filtered to
+exclude the `laminate-runtime` project artifact itself (already covered by
+layer 1's `classDirectories` entry — merging both would double-include its
+classes).
+
+|3. `paperclipJar`
+|The downloaded, verified paperclip jar from <<download-caching,11.3>> —
+lowest priority.
+|===
+
+**Duplicate-handling policy** ("ours wins"): within layers 1 and 2, a path
+collision against something already written is treated as *unexpected* — the
+task's own doc comment notes first-party packages should never overlap by
+design, and third-party libraries shouldn't ship colliding classes either — so
+it is logged as a build warning (`getLogger().warn(...)`) but does not fail the
+build; the earlier-written entry silently wins. A collision against layer 3
+(paperclip itself) is the *intentional*, already-established policy — this
+project's own classes and its own runtime libraries always take priority over
+whatever paperclip happens to also carry — and that case stays completely
+silent, matching the task's original (pre-library-merging) behaviour.
+Paperclip's own `META-INF/MANIFEST.MF` and any `META-INF/*.SF`/`*.RSA`/`*.DSA`
+signature files are unconditionally excluded from every layer (a repackaged
+jar invalidates any embedded jar signature); a single fresh manifest, built by
+this task, is written instead.
+
+=== 11.5. The per-package manifest attribute trick
+
+Flattening every library jar's classes into one output jar with a single fresh
+manifest silently discards each source jar's *own* `META-INF/MANIFEST.MF` —
+including standard `Implementation-Version`/`Specification-Version`/`*-Title`/
+`*-Vendor` attributes that some libraries read back at run time via
+`Class.getPackage().getImplementationVersion()`. This is a real JDK mechanism:
+a jar manifest can carry per-package `Name: some/package/` sections with their
+own attributes, which `Package` consults on a per-package basis before falling
+back to the jar's main attributes — and it broke a real dependency here.
+
+Sponge Mixin's own ASM-version self-detection
+(`org.spongepowered.asm.util.asm.ASM`) relies on exactly this mechanism. With
+no `Implementation-Version` attribute reachable for `org.objectweb.asm` after
+a naive flatten-everything merge, Mixin silently under-detects the bundled ASM
+as version `"9.0"` instead of the real `9.10.1`
+(`gradle/libs.versions.toml`'s `asmUtil` version), which in turn made
+`MixinEnvironment.CompatibilityLevel.JAVA_21` report itself unsupported and
+hard-failed *every* hybrid plugin whose mixin config requested it. The task's
+own doc comment records this was found live, during an end-to-end boot test
+with a real hybrid plugin — not anticipated in the abstract.
+
+The fix is `LaminateServerJarTask#populateLibraryPackageManifestAttributes`: a
+read-only pre-pass over every `libraryJars` entry, run before the merged
+manifest is finalized (and before the output `JarOutputStream` — which writes
+the manifest as its very first entry — is even opened). For each library jar
+whose own manifest declares any of a fixed propagated-attribute list
+(`Implementation-Title`, `Implementation-Version`, `Implementation-Vendor`,
+`Specification-Title`, `Specification-Version`, `Specification-Vendor`), it
+copies those attributes into a per-package manifest section of the merged
+manifest, for *every* package that jar actually contributes `.class` files to
+— restoring, in the single-manifest merged output, the same
+`Class.getPackage().getImplementation/SpecificationXxx()` answers a class
+would have seen had it been loaded from its own original jar. Consistent with
+the task's general "earlier layer wins" policy, a package section already
+claimed by an earlier library jar is left untouched (`Map#putIfAbsent`). This
+fixes the mechanism generally — for any bundled library that happens to rely
+on it, not merely the one (ASM) that first surfaced the bug.
+
+=== 11.6. Final manifest attributes
+
+Read directly from `LaminateServerJarTask#run`:
+
+[cols="1,2"]
+|===
+|Attribute |Value
+
+|`Manifest-Version`
+|`1.0`
+
+|`Main-Class`
+|`eu.lschreiber.laminate.launcher.LaminateMain`
+
+|`Bundler-Main-Class`
+|Whatever `Main-Class` the *downloaded paperclip jar* itself declared (read
+back from its own manifest via `readPaperclipMainClass`, e.g.
+`io.papermc.paperclip.Main`) — preserved under this custom attribute name so
+`LaminateMain` can hand off to paperclip's own bootstrap via reflection once
+it has done its own setup.
+
+|`Premain-Class`
+|`eu.lschreiber.laminate.agent.LaminateAgent`
+
+|`Agent-Class`
+|`eu.lschreiber.laminate.agent.LaminateAgent`
+
+|`Can-Retransform-Classes`
+|`true`
+
+|`Can-Redefine-Classes`
+|`true`
+|===
+
+Two things worth flagging explicitly:
+
+* `Launcher-Agent-Class` is **deliberately not set**, even though the jar is
+  also its own Java agent. The task's own comment explains why, citing a live
+  end-to-end finding: if `Launcher-Agent-Class` were set, the JVM launcher
+  would auto-load `LaminateAgent` (via `agentmain()`, which delegates to
+  `premain()`) on *every* invocation, including the very first, flag-less one
+  — which would satisfy `LaminateMain`'s "is the agent loaded?" check
+  immediately, so `RelaunchHandler.relaunch()` (the mechanism that actually
+  appends the JVM's required `--add-opens` flags before the agent can safely
+  do its job) would never run. Since `Launcher-Agent-Class` cannot itself
+  supply extra JVM flags, that would silently strand the process without the
+  `--add-opens` it needs, forever. Self-relaunch via an explicit `-javaagent:`
+  flag, driven by `RelaunchHandler`, must stay the only path by which
+  `LaminateAgent` gets loaded.
+* `Premain-Class`/`Agent-Class`/`Can-Retransform-Classes`/`Can-Redefine-Classes`
+  match the reference fork's own `createLaminateServerJar` manifest attributes
+  exactly, by explicit intent recorded in the task's comment — an earlier
+  version of this task had added `Launcher-Agent-Class` on top, and that
+  regressed the relaunch flow described above until it was removed again.

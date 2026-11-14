@@ -1,0 +1,187 @@
+// ============================================================
+[[bridge-and-core-mixins]]
+== 8. The Cross-Classloader Bridge and Core Mixins
+// ============================================================
+
+The reference fork replicated a handful of Paper-internal UX behaviors — culling failed hybrid
+plugins, blocking `/reload` while any hybrid plugin is loaded, and adding a "Laminate Plugins"
+line to `/plugins` — by directly editing Paper's own source (`PluginInitializerManager`,
+`ReloadCommand`, `PaperPluginsCommand`). Laminate has no forked Paper source to edit, so it
+reproduces the same behaviors as its own always-on mixins, targeting vanilla Paper's unmodified
+classes through the exact same mixin pipeline hybrid plugins themselves use — dogfooding the
+pipeline rather than special-casing it.
+
+=== 8.1. `laminate-bridge` and `LaminateBridge`
+
+`laminate-bridge` is a tiny, dependency-free module whose only class is
+`LaminateBridge` (`laminate-bridge/src/main/java/eu/lschreiber/laminate/bridge/LaminateBridge.java`).
+It exists purely to answer one question for any other piece of code that asks: *which hybrid
+plugins loaded successfully, and which failed?* `LaminateRuntimeBootstrap`'s Stage B
+(<<bootstrap>>) calls `LaminateBridge.recordResult(loaded, failed)` exactly once, after mixin
+registration completes; `LaminateBridge.loadedHybridPluginNames()` and
+`failedHybridPluginNames()` are read-only queries any other class can call at any later point.
+Both accessors return unmodifiable, defensively-copied views; the failed-plugin set is lower-cased
+on the way in, the loaded-plugin set keeps its original case. `isActive()` reports whether
+`recordResult` has run yet at all.
+
+`laminate-bridge` deliberately holds no orchestration logic of its own — everything about *how*
+plugins get loaded lives in `LaminateRuntimeBootstrap`; this class is just the published result.
+
+==== A genuine cross-classloader identity gap
+
+Being on `bundlerLoader`'s classpath does **not**, by itself, make `LaminateBridge` a single
+shared class instance for the whole process — this is subtle enough, and was the source of a real
+bug found live during this project's development, that it is worth spelling out precisely.
+
+`LaminateMain.main()` calls `LaminateRuntimeBootstrap.bootstrap()`/`transformerForGameLoad()` as
+ordinary Java method calls. That means the entire call graph reachable from `LaminateMain` —
+including `LaminateBridge`, referenced from `LaminateRuntimeBootstrap` at compile time — resolves
+through the JVM's *application* classloader (the one that loaded `LaminateMain` itself off the
+`-jar`/`Main-Class` classpath), **not** `bundlerLoader`. `bundlerLoader` is a separate
+`URLClassLoader`, constructed later, at runtime, inside `main()`, parented directly to the
+platform classloader (see <<launcher>>) — it never delegates to the application classloader, so
+the first time anything asks *it* to resolve `eu.lschreiber.laminate.bridge.LaminateBridge`, it
+defines its own, entirely independent `Class` object for that name.
+
+Core mixins (this chapter's whole point) are woven into vanilla Paper classes, which are defined
+by `serverLoader` — a genuine descendant of `bundlerLoader` (via the classloader-interposition
+trick described in <<architecture>> and <<launcher>>), not of the application classloader. When
+woven core-mixin code calls `LaminateBridge.loadedHybridPluginNames()`, the JVM resolves that
+symbolic reference through `serverLoader`'s own delegation chain — reaching `bundlerLoader`'s
+independent copy of `LaminateBridge`, not the application-classloader copy that
+`LaminateRuntimeBootstrap` actually wrote to with `recordResult`. Two distinct `Class` objects for
+identical bytecode never share static field state, no matter how much their classpaths overlap —
+this is ordinary JVM classloader semantics, not a bug in the JVM.
+
+This gap was invisible throughout earlier development because nothing woven into `serverLoader`
+code had ever read `LaminateBridge` before — hybrid plugins only ever reference `laminate-api`
+types from mixin code (see <<laminate-api>>), and `laminate-api`'s own cross-classloader design
+(reflective resolution via the target's own loader) sidesteps the problem entirely.
+`PluginInitializerManagerMixin`, `ReloadCommandMixin`, and `PaperPluginsCommandMixin`
+(<<core-mixins>>) are the first consumers that read `LaminateBridge` directly from woven code, and
+so were the first to expose the gap.
+
+The fix, `LaminateRuntimeBootstrap.publishToBundlerNamespaceBridge`, is a best-effort *second*
+publish: immediately after the ordinary `LaminateBridge.recordResult` call (which updates the
+application-classloader copy), Stage B also reflectively resolves
+`eu.lschreiber.laminate.bridge.LaminateBridge` through its own captured handle to `bundlerLoader`
+and invokes `recordResult` on *that* copy too, via reflection (since the two `Class` objects are
+not assignment-compatible with each other despite sharing a fully-qualified name). Failure here —
+most notably in a plain unit-test JVM, where no real `bundlerLoader` exists — is caught and logged
+at `DEBUG`, not propagated, since the ordinary `recordResult` call already covers the class's own,
+directly-referenced copy regardless.
+
+The general lesson, worth remembering before adding any new reader or writer of `LaminateBridge`:
+"reachable from `bundlerLoader`'s classpath" is necessary but not sufficient for two pieces of
+code to actually observe each other's writes to this class. What matters is which concrete
+`ClassLoader` resolved the symbolic reference at the call site in question.
+
+=== 8.2. `laminate-core-mixins`
+
+`laminate-core-mixins` is a small Gradle module (`laminate-core-mixins/build.gradle.kts`)
+containing exactly three `@Mixin` classes plus their shared config file. It is built with the
+`io.papermc.paperweight.userdev` plugin (its version declared once at the repository root and
+applied version-less here, working around a real upstream Gradle plugin-application bug — see
+<<build,the build chapter>>) so its mixin classes can be written and compiled against real,
+Mojang-mapped Paper/NMS internals via `paperweight.paperDevBundle`, the exact same mechanism
+`test-plugin` uses (<<test-plugin>>) — this module is a first-party demonstration that hybrid-plugin
+authors and Laminate's own maintainers use the identical tooling. `sponge-mixin` is `compileOnly`
+here (the runtime copy is already provided by `laminate-runtime` and merged once into the final
+server jar); `laminate-bridge` is an ordinary `implementation` dependency, since core mixins
+genuinely need `LaminateBridge` present at runtime, not merely at compile time.
+
+Its compiled classes and resources are merged into the final `laminate-server-<mcversion>.jar`
+alongside `laminate-runtime`'s own output (see <<build>>), and its one config file,
+`laminate-core.mixins.json`, is queued unconditionally by `LaminateRuntimeBootstrap`'s Stage A and
+registered unconditionally by Stage B — every boot, regardless of whether any third-party hybrid
+plugin was even discovered:
+
+[source,json]
+----
+{
+  "required": false,
+  "package": "eu.lschreiber.laminate.mixins.core",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "PluginInitializerManagerMixin",
+    "ReloadCommandMixin",
+    "PaperPluginsCommandMixin"
+  ]
+}
+----
+
+`"required": false` is deliberate: if a future Paper version renames or restructures one of these
+three target classes, Sponge Mixin's own target-resolution failure handling degrades that one
+mixin to a logged warning rather than crashing the server — the same graceful-degradation posture
+`LaminateMixinTransformer`'s own per-class exception handling provides for hybrid plugins
+generally (<<transformer>>). All three mixins treat `LaminateBridge` as strictly read-only —
+nothing in this module ever calls `recordResult`.
+
+[[core-mixins]]
+==== `PluginInitializerManagerMixin`
+
+Targets `io.papermc.paper.plugin.PluginInitializerManager`, the class responsible for discovering
+and initializing every plugin provider at boot. Two injections:
+
+* `@Inject(method = "load", at = @At("TAIL"))` — after vanilla's own plugin-count logging runs
+  (the last statements of the real method body), this removes any registered provider whose
+  plugin name is in `LaminateBridge.failedHybridPluginNames()` from every entrypoint's provider
+  storage (via `LaunchEntryPointHandler.INSTANCE.getStorage()`), so a hybrid plugin whose mixin
+  bootstrap failed is never initialized and never appears in `/plugins` — the rest of the server,
+  and every other plugin, continues starting normally. It then logs a
+  `"[Laminate] Laminate plugins (N): ..."` line for every successfully-loaded hybrid plugin
+  (name-based matching against `LaminateBridge.loadedHybridPluginNames()` — there is no
+  `LaminatePluginProvider` marker subtype in this project, unlike the fork), one-per-line when
+  debug logging is enabled and comma-joined otherwise, matching vanilla's own adjacent
+  Paper-plugin/Bukkit-plugin logging style.
+* `@Inject(method = "reload", at = @At("TAIL"))` — if any hybrid plugin is currently loaded, logs a
+  loud warning block explaining that hybrid plugins do not support being reloaded. This is a
+  *warning* only; `ReloadCommandMixin` (below) is what actually blocks `/reload` from running.
+
+This class uses `com.mojang.logging.LogUtils.getClassLogger()` — Paper's own SLF4J/Log4j-backed
+logger — rather than the plain `LaminateLog` helper `laminate-runtime` uses for its own,
+genuinely-pre-Log4j logging (<<bootstrap>>). The distinction matters: `PluginInitializerManager`'s
+own vanilla logging, via this exact same `LogUtils` mechanism, is already active and captured in
+`logs/latest.log` by the time `load()`/`reload()` run (confirmed by reading the real Paper source
+for `PluginInitializerManager.load()`, whose very first statement is itself a `LogUtils`-backed log
+call) — so there is no reason not to use the real thing and land in the same log file an operator
+already watches. `laminate-runtime`'s own bootstrap code has no such luxury: most of it runs
+before Paperclip — and therefore before Log4j — has been set up at all.
+
+==== `ReloadCommandMixin`
+
+Targets `io.papermc.paper.command.subcommands.ReloadCommand`.
+`@Inject(method = "execute", at = @At("HEAD"), cancellable = true)` — if any hybrid plugin is
+loaded, broadcasts two red warning messages ("Reloading the server while hybrid plugins are loaded
+is not supported" / "Consider restarting the server instead. Reload cancelled") and cancels the
+injected method outright, via `callbackInfoReturnable.setReturnValue(false)` **and**
+`.cancel()` — both calls are required; `setReturnValue` alone does not stop vanilla's
+`doReload()` from running afterward. Mixin transformations are irreversible process state: hybrid
+plugins' woven bytecode cannot be un-woven or re-applied, so reloading Paper's own
+configs/plugins while any are active would leave the server in an inconsistent state. A full
+restart is the only supported way to pick up new or changed hybrid plugin mixins.
+
+==== `PaperPluginsCommandMixin`
+
+Targets `io.papermc.paper.command.PaperPluginsCommand`, best-effort and deliberately
+lower-fidelity than the other two. Vanilla's real `execute` method categorizes providers into
+Paper and Bukkit/Spigot sections using several `private static` helper methods that a mixin cannot
+reach without hand-writing `@Invoker` accessors for each one — and even then could not reproduce
+the fork's exact category *ordering* or its shared header-size recomputation across categories,
+both of which are baked into the middle of vanilla's method rather than at its tail.
+`@Inject(method = "execute", at = @At("TAIL"))` therefore takes a simpler route: after both
+vanilla categories have printed, it appends one additional plain message line — no per-plugin
+click/hover decoration — listing loaded hybrid plugin names in a distinct color
+(`0xff4245`, matching the fork's own header color), e.g.
+`"Laminate Plugins (1): test-plugin"`.
+
+=== 8.3. How this all fits together
+
+Putting <<bootstrap>>, <<quilt-adapter>>, <<transformer>>, and this chapter together: Stage A
+queues `laminate-core.mixins.json` unconditionally; Stage B registers it unconditionally, the
+first real game class load, exactly like any hybrid plugin's own config; from that point on,
+`PluginInitializerManagerMixin`, `ReloadCommandMixin`, and `PaperPluginsCommandMixin` are woven
+into vanilla Paper the same way a third-party hybrid plugin's own mixins would be, and all three
+communicate with the rest of the system exclusively by reading `LaminateBridge` — the same bridge
+class, with the same cross-classloader caveat, that any future core mixin or hybrid plugin
+consulting it will need to account for.

@@ -1,69 +1,36 @@
-import org.gradle.api.tasks.testing.logging.TestExceptionFormat
-import org.gradle.api.tasks.testing.logging.TestLogEvent
-
+/**
+ * Declares paperweight once at the root to avoid the multi-project classloader bug it can hit when
+ * several subprojects apply it with their own versioned plugin blocks.
+ */
 plugins {
-    id("io.papermc.paperweight.core") version "2.0.0-beta.19" apply false
+    id("io.freefair.lombok") version "9.5.0" apply false
+    id("io.papermc.paperweight.userdev") version "2.0.0-beta.21" apply false
+}
+
+allprojects {
+    group = "eu.lschreiber.laminate"
+    version = providers.gradleProperty("laminateVersion").getOrElse("0.1.0-SNAPSHOT")
 }
 
 subprojects {
-    apply(plugin = "java-library")
-    apply(plugin = "maven-publish")
+    apply(plugin = "java")
+    apply(plugin = "io.freefair.lombok")
 
     extensions.configure<JavaPluginExtension> {
         toolchain {
-            languageVersion = JavaLanguageVersion.of(21)
-        }
-    }
-}
-
-val paperMavenPublicUrl = "https://repo.papermc.io/repository/maven-public/"
-
-subprojects {
-    tasks.withType<JavaCompile>().configureEach {
-        options.encoding = Charsets.UTF_8.name()
-        options.release = 21
-        options.isFork = true
-        options.compilerArgs.addAll(listOf("-Xlint:-deprecation", "-Xlint:-removal"))
-    }
-    tasks.withType<Javadoc>().configureEach {
-        options.encoding = Charsets.UTF_8.name()
-    }
-    tasks.withType<ProcessResources>().configureEach {
-        filteringCharset = Charsets.UTF_8.name()
-    }
-    tasks.withType<Test>().configureEach {
-        testLogging {
-            showStackTraces = true
-            exceptionFormat = TestExceptionFormat.FULL
-            events(TestLogEvent.STANDARD_OUT)
+            languageVersion = JavaLanguageVersion.of(25)
         }
     }
 
     repositories {
         mavenCentral()
-        maven(paperMavenPublicUrl)
     }
 
-    extensions.configure<PublishingExtension> {
-        repositories {
-            maven("https://artifactory.papermc.io/artifactory/snapshots/") {
-                name = "paperSnapshots"
-                credentials(PasswordCredentials::class)
-            }
-        }
+    tasks.withType<Test>().configureEach {
+        useJUnitPlatform()
     }
-}
 
-tasks.register("printMinecraftVersion") {
-    val mcVersion = providers.gradleProperty("mcVersion")
-    doLast {
-        println(mcVersion.get().trim())
-    }
-}
-
-tasks.register("printLaminateVersion") {
-    val laminateVersion = provider { project.version }
-    doLast {
-        println(laminateVersion.get())
+    tasks.withType<JavaCompile>().configureEach {
+        options.encoding = "UTF-8"
     }
 }

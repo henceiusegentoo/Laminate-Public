@@ -1,0 +1,484 @@
+// ============================================================
+[[hybrid-plugin-dev]]
+== 13. Developing a Hybrid Plugin
+// ============================================================
+
+This chapter walks through building a hybrid plugin from scratch — from project setup to a
+running server with your mixin applied — using the same real, working example the Laminate
+maintainers use to verify the project: the in-repo `test-plugin` module. Every file name, YAML/
+JSON field, dependency coordinate, and annotation shown here is taken directly from that module,
+not written from memory.
+
+=== 13.1. Prerequisites
+
+[cols="1,2"]
+|===
+|Prerequisite |Detail
+
+|Java 25 JDK
+|Required by the bundled Paper `26.x` build and by Laminate's annotation processors. `JAVA_HOME`
+must point at a JDK 25+ installation.
+
+|Gradle 8+ (via the wrapper)
+|`paperweight-userdev` requires a modern Gradle. Use the project's `./gradlew` wrapper rather than
+a system-wide Gradle install.
+
+|A Laminate server jar to test against
+|Build one from the `laminate-standalone` repository root with `./gradlew laminateServerJar`; the
+output is `build/libs/laminate-server-<paperVersion>.jar` (the `paperVersion` currently pinned in
+the root `gradle.properties`).
+|===
+
+=== 13.2. Project structure
+
+The reference plugin, `test-plugin`, is laid out like this:
+
+....
+test-plugin/
+├── build.gradle.kts
+└── src/main/
+    ├── java/eu/lschreiber/testplugin/
+    │   ├── TestPlugin.java
+    │   ├── accessor/                       (generated at compile time — see §13.8)
+    │   ├── events/
+    │   │   └── ServerLevelTickStartEvent.java
+    │   ├── listener/
+    │   │   └── TickListener.java
+    │   └── mixins/
+    │       ├── ServerMixin.java
+    │       └── ServerLevelMixin.java
+    └── resources/
+        ├── plugin.yml
+        └── mixins.testplugin.json
+....
+
+If you're developing inside the `laminate-standalone` monorepo (the way `test-plugin` itself
+does), add your module to the root `settings.gradle.kts`'s `include(...)` list and depend on
+`laminate-api` as an in-repo project. If you're developing a standalone, out-of-tree plugin
+project instead, see the note in <<hybrid-build-gradle,§13.4>> about resolving `laminate-api` from
+`mavenLocal()`.
+
+=== 13.3. Package naming
+
+There is no framework-enforced package convention, but keep mixin classes in their own
+sub-package — `test-plugin` uses `eu.lschreiber.testplugin.mixins` — because the mixin
+configuration file (<<mixin-config,§13.6>>) declares that package once and lists only simple
+class names underneath it.
+
+[[hybrid-build-gradle]]
+=== 13.4. `build.gradle.kts`
+
+This is `test-plugin`'s actual build file, reproduced in full:
+
+[source,kotlin]
+----
+plugins {
+    id("com.gradleup.shadow") version "9.6.0"                    // <1>
+    id("io.papermc.paperweight.userdev")                          // <2>
+}
+
+repositories {
+    maven("https://repo.papermc.io/repository/maven-public/")
+    maven("https://maven.fabricmc.net/")                          // <3>
+}
+
+dependencies {
+    // Mixin annotations + MixinExtras - Laminate provides both at runtime; never shade these.
+    compileOnly("net.fabricmc:sponge-mixin:0.17.3+mixin.0.8.7")            // <4>
+    compileOnly("io.github.llamalad7:mixinextras-common:0.5.4")             // <5>
+    annotationProcessor("io.github.llamalad7:mixinextras-common:0.5.4")     // <6>
+
+    // laminate-api: @InjectEvent / @GenerateAccessor annotations and their annotation
+    // processors. Also provided by Laminate at runtime; never shade this either.
+    compileOnly(project(":laminate-api"))                                  // <7>
+    annotationProcessor(project(":laminate-api"))                          // <7>
+
+    // NMS + Paper API via paperweight userdev (Mojang-mapped, required for mixin development).
+    paperweight.paperDevBundle(providers.gradleProperty("paperDevBundleVersion").get())  // <8>
+}
+
+tasks.build {
+    dependsOn(tasks.shadowJar)                                            // <9>
+}
+
+tasks.processResources {
+    val props = mapOf("version" to version)
+    filesMatching("plugin.yml") {
+        expand(props)                                                    // <10>
+    }
+}
+----
+<1> Shadow produces the fat jar you actually deploy.
+<2> `paperweight-userdev` provides the official, Mojang-mapped Paper dev bundle at compile time —
+    the *same* Paper artifact Laminate itself bundles at build time, not a Laminate-specific dev
+    bundle. Applied version-less here because the version is declared once, centrally, in the
+    monorepo's root `build.gradle.kts` (`apply false`) to avoid a known
+    Gradle/paperweight-userdev classloader bug when the plugin is applied independently in more
+    than one subproject.
+<3> The Fabric maven repository, needed to resolve `sponge-mixin`.
+<4> SpongePowered Mixin — `@Mixin`, `@Inject`, `@Unique`, etc. `compileOnly` because Laminate
+    puts this exact coordinate on the server classpath at runtime; shading it creates duplicate
+    class definitions in the class-loading layer that matters most.
+<5> MixinExtras annotations (`@WrapOperation` and friends). Also `compileOnly` for the same
+    reason.
+<6> The MixinExtras annotation processor generates helper code MixinExtras needs at runtime.
+<7> `laminate-api` supplies `@GenerateAccessor` and `@InjectEvent` plus their annotation
+    processors. Inside the monorepo this is a project dependency
+    (`project(":laminate-api")`), both as `compileOnly` (Laminate puts it on the server classpath)
+    and as `annotationProcessor` (to actually run the processors at compile time). Developing
+    outside the monorepo: publish it to your local repository once from the `laminate-standalone`
+    root with `./gradlew :laminate-api:publishToMavenLocal`, add `mavenLocal()` to your plugin's
+    `repositories {}`, and depend on the coordinate `eu.lschreiber.laminate:laminate-api:<version>`
+    (matching the root `gradle.properties`' `laminateVersion`) the same way, `compileOnly` plus
+    `annotationProcessor`.
+<8> Pulls in Mojang-mapped NMS classes (e.g. `net.minecraft.server.MinecraftServer`) and the
+    Paper API at the exact version named by `paperDevBundleVersion` — a separate property from
+    `paperVersion`, holding the full dev-bundle Maven coordinate string (see <<build,chapter
+    11>>'s §11.1) — so your mixin targets compile against real, current internals. Developing
+    outside the monorepo, set this to whatever `paperweight.paperDevBundle(...)` expects for your
+    target Paper version directly (check
+    https://repo.papermc.io/repository/maven-public/io/papermc/paper/paper-api/ for the exact
+    currently-published coordinate) rather than trying to derive it from a bare version number.
+<9> Ensures `./gradlew build` always produces the shaded jar, not just the thin one.
+<10> Expands `$version` inside `plugin.yml` from the Gradle project version at build time (see
+    <<hybrid-plugin-yml,§13.5>>).
+
+=== 13.5. `plugin.yml`
+
+[[hybrid-plugin-yml]]
+[source,yaml]
+----
+name: test-plugin
+version: '$version'
+
+main: eu.lschreiber.testplugin.TestPlugin
+api-version: '1.21'
+load: POSTWORLD
+
+authors: [ leander ]
+
+hybrid: true                              # <1>
+mixins:
+  - mixins.testplugin.json                # <2>
+  - mixins.testplugin.generated.json      # <3>
+----
+<1> `hybrid: true` is the flag `HybridPluginDescriptorReader` looks for. Without it, Laminate
+    treats the jar as an ordinary Bukkit plugin and no mixins are ever registered — the `mixins:`
+    key below is simply ignored.
+<2> Your hand-written mixin configuration file — see <<mixin-config,§13.6>>. Every entry here
+    must correspond to a real file packaged inside the jar; `HybridPluginDescriptorReader`
+    verifies this at plugin-load time and disables the whole plugin (see
+    <<operations,Chapter 12>>'s discussion of failed bootstrap) if one is missing.
+<3> Generated automatically by the `@InjectEvent` annotation processor — only needed if you use
+    that annotation (see <<inject-event,§13.9>>). If you don't, omit this line entirely.
+
+`hybrid`, `mixins`, `name`, and `version` are read directly out of the raw YAML by
+`HybridPluginDescriptorReader` using `snakeyaml` — `name` must be present and non-blank, and
+`mixins` must be a non-empty list, or the plugin fails to bootstrap.
+
+[[mixin-config]]
+=== 13.6. Mixin configuration file (`mixins.testplugin.json`)
+
+[source,json]
+----
+{
+  "required": true,
+  "package": "eu.lschreiber.testplugin.mixins",     // <1>
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "ServerMixin",                                   // <2>
+    "ServerLevelMixin"
+  ]
+}
+----
+<1> Must exactly match the Java package containing your `@Mixin` classes.
+<2> Simple class names only (no package prefix) of every hand-written `@Mixin` class in this
+    config. `@InjectEvent`-generated companion mixins go in the separate, auto-produced
+    `mixins.testplugin.generated.json` instead — never list them here by hand.
+
+=== 13.7. Writing a mixin class
+
+`test-plugin`'s simplest mixin, `ServerMixin`, targets `net.minecraft.server.MinecraftServer` and
+adds a new method:
+
+[source,java]
+----
+package eu.lschreiber.testplugin.mixins;
+
+import eu.lschreiber.laminateapi.accessor.GenerateAccessor;
+import net.minecraft.server.MinecraftServer;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
+
+@Mixin(MinecraftServer.class)                          // <1>
+public final class ServerMixin {
+
+    @GenerateAccessor(name = "write")                   // <2>
+    @Unique                                             // <3>
+    public void testPlugin$write(final String msg) {    // <4>
+        System.out.println("[test-plugin] write() injected via mixin: " + msg);
+    }
+}
+----
+<1> `MinecraftServer.class` is available at compile time via `paperweight-userdev`. Mixin targets
+    must use Mojang-mapped names — Laminate does not remap at runtime.
+<2> Covered in <<generate-accessor,§13.8>>.
+<3> `@Unique` marks this as a brand-new method added by the mixin, not an override of an existing
+    one.
+<4> Prefix injected members with a plugin-unique namespace (`testPlugin$`) to avoid collisions
+    with other plugins' mixins targeting the same class — SpongePowered Mixin raises a hard
+    error at bootstrap if two mixins add a member with the same name to the same target.
+
+[[generate-accessor]]
+=== 13.8. Generating an accessor with `@GenerateAccessor`
+
+A mixin-injected method isn't visible to your plugin's ordinary code by normal Java means — you
+can't just cast an NMS object and call it. `@GenerateAccessor` (from `eu.lschreiber.laminateapi.
+accessor`) solves this by generating a small interface at compile time. Annotate the injected
+method (as `ServerMixin` does above) and the processor emits, in a sibling `.accessor` package:
+
+[source,java]
+----
+package eu.lschreiber.testplugin.accessor;
+
+import eu.lschreiber.laminateapi.accessor.LaminateAccessors;
+
+/** Generated by GenerateAccessorProcessor. Do not edit manually. */
+public interface MinecraftServerAccessor {
+
+    void write(java.lang.String p0);
+
+    static MinecraftServerAccessor of(Object target) {
+        return LaminateAccessors.create(MinecraftServerAccessor.class, target,
+                new String[]{"write", "testPlugin$write"});
+    }
+}
+----
+
+The interface method name comes from `@GenerateAccessor(name = ...)` (falling back to the mixin
+method's own name when omitted); the class name is `{TargetSimpleName}Accessor`. Using it from
+plugin code — `TestPlugin.java` registers a `/testcmd` command that does exactly this:
+
+[source,java]
+----
+final MinecraftServer server = ((CraftServer) getServer()).getServer();
+final MinecraftServerAccessor accessor = MinecraftServerAccessor.of(server);
+accessor.write("Hello World");
+----
+
+`MinecraftServerAccessor.of(...)` wraps the live NMS object; calling `write(...)` on the returned
+interface reflectively invokes the mixin-injected `testPlugin$write` method on it.
+
+[[inject-event]]
+=== 13.9. Firing Bukkit events from NMS code with `@InjectEvent`
+
+`@InjectEvent` (from `eu.lschreiber.laminateapi.event`) generates a whole companion `@Mixin`
+class for you, so you don't hand-write an `@Inject` method just to translate an NMS call into a
+Bukkit event. `test-plugin` uses it to fire a custom event at the start of every world tick.
+
+==== 13.9.1. Define the event
+
+[source,java]
+----
+package eu.lschreiber.testplugin.events;
+
+import net.minecraft.server.level.ServerLevel;
+import org.bukkit.event.Event;
+import org.bukkit.event.HandlerList;
+import java.util.function.BooleanSupplier;
+
+public final class ServerLevelTickStartEvent extends Event {
+
+    private static final HandlerList HANDLER_LIST = new HandlerList();
+
+    private final ServerLevel handle;
+    private final BooleanSupplier hasTime;
+
+    public ServerLevelTickStartEvent(ServerLevel handle, BooleanSupplier hasTime) {   // <1>
+        this.handle = handle;
+        this.hasTime = hasTime;
+    }
+
+    public ServerLevel getHandle() { return this.handle; }
+    public boolean hasTime() { return this.hasTime.getAsBoolean(); }
+
+    @Override public HandlerList getHandlers() { return HANDLER_LIST; }
+    public static HandlerList getHandlerList() { return HANDLER_LIST; }
+}
+----
+<1> The first constructor parameter must be the Mixin target instance (`this` inside the injected
+    method — here, the ticking `ServerLevel`); subsequent parameters must match the marker
+    method's own parameters, in order.
+
+==== 13.9.2. Annotate a marker method in a mixin
+
+[source,java]
+----
+package eu.lschreiber.testplugin.mixins;
+
+import eu.lschreiber.laminateapi.event.At;
+import eu.lschreiber.laminateapi.event.InjectEvent;
+import eu.lschreiber.testplugin.events.ServerLevelTickStartEvent;
+import net.minecraft.server.level.ServerLevel;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
+import java.util.function.BooleanSupplier;
+
+@Mixin(ServerLevel.class)
+public abstract class ServerLevelMixin {
+
+    @Unique
+    @InjectEvent(
+            method = "tick",                              // <1>
+            at = At.HEAD,                                 // <2>
+            event = ServerLevelTickStartEvent.class        // <3>
+    )
+    private void testPlugin$onTick(BooleanSupplier hasTime) {   // <4>
+        // Marker only - the @InjectEvent processor generates the real injection.
+    }
+}
+----
+<1> Simple name of the NMS method to inject into. For an overloaded method, use
+    `methodRewrite = @Rewrite(method = "...", args = { ... })` instead of `method` to
+    disambiguate by parameter types (`method` and `methodRewrite` are mutually exclusive —
+    exactly one must be set).
+<2> `At.HEAD` injects before the target method's first instruction. `At` also offers `TAIL`
+    (before every `RETURN`), `RETURN` (immediately before each `RETURN` opcode), and `INVOKE`
+    (before a specific call site, identified via `InjectEvent#target()`).
+<3> The event class to instantiate and fire.
+<4> The marker method's own parameter list (excluding the receiver) becomes the extra
+    constructor arguments forwarded to the event after `this`.
+
+The processor generates a companion mixin roughly like this (from `test-plugin`'s own build
+output) — you never write or edit it by hand:
+
+[source,java]
+----
+@Mixin(targets = "net.minecraft.server.level.ServerLevel")
+abstract class ServerLevelInjectEvent_testPlugin_onTick {
+
+    @Inject(method = "tick", at = @At("HEAD"), cancellable = false)
+    private void laminate$injectEvent_ServerLevelInjectEvent_testPlugin_onTick(
+            java.util.function.BooleanSupplier p0, CallbackInfo ci) {
+        eu.lschreiber.laminateapi.event.LaminateEventBridge.fire(
+            "eu.lschreiber.testplugin.events.ServerLevelTickStartEvent",
+            (Object) (Object) this, new Object[]{p0});
+    }
+}
+----
+
+Every generated companion class like this one is collected into `mixins.testplugin.generated.
+json` automatically at compile time — you don't create or edit that file, you only need to add
+its name to `plugin.yml`, which the example in <<hybrid-plugin-yml,§13.5>> already does.
+
+==== 13.9.3. Consume the event like any other Bukkit event
+
+[source,java]
+----
+package eu.lschreiber.testplugin.listener;
+
+import eu.lschreiber.testplugin.events.ServerLevelTickStartEvent;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import java.util.logging.Logger;
+
+public final class TickListener implements Listener {
+
+    private static final Logger LOGGER = Logger.getLogger(TickListener.class.getName());
+
+    @EventHandler
+    public void onServerLevelTickStart(final ServerLevelTickStartEvent event) {
+        if (!event.hasTime()) {
+            return;
+        }
+        final String worldName = event.getHandle().getWorld().getName();
+        final int playerCount = event.getHandle().players().size();
+        LOGGER.info(() -> "[Laminate] @InjectEvent fired - tick start in world="
+                + worldName + ", players=" + playerCount);
+    }
+}
+----
+
+Registered normally in `onEnable()`:
+
+[source,java]
+----
+@Override
+public void onEnable() {
+    getServer().getPluginManager().registerEvents(new TickListener(), this);
+}
+----
+
+Nothing about consuming the event is special — from the listener's point of view it's an
+ordinary Bukkit `Event`. `@InjectEvent` only automates the plumbing that gets it fired from NMS
+code in the first place.
+
+=== 13.10. Building and testing locally
+
+Build the shaded jar:
+
+[source,bash]
+----
+./gradlew shadowJar
+----
+
+The output lands at `build/libs/test-plugin-<version>-all.jar` (Shadow's default `-all`
+classifier). Copy that jar into the `plugins/` directory next to the
+`laminate-server-<mcversion>.jar` you built per the prerequisites (§13.1), then start
+(or restart — never `/reload`, see <<operations,Chapter 12>>) the server:
+
+[source,bash]
+----
+java -jar laminate-server-<mcversion>.jar nogui
+----
+
+Watch the console for the summary line confirming your plugin's mixins were applied:
+
+----
+[Laminate] Laminate plugins (1):
+ - test-plugin (0.1.0-SNAPSHOT)
+----
+
+If your plugin doesn't show up there, check for a `WARNING`-level line naming it and its jar
+path instead — that means its descriptor or mixin registration failed (see
+<<operations,Chapter 12, §12.7>> for the exact list of causes) and it was silently disabled
+rather than crashing the server. With `test-plugin` specifically, running `/testcmd` in-game
+should print `[test-plugin] write() injected via mixin: Hello World` to the console (proving
+`@GenerateAccessor` reached the mixin-injected method), and normal world ticking should produce
+periodic `[Laminate] @InjectEvent fired - tick start in world=...` log lines (proving
+`@InjectEvent` is bridging the NMS tick loop into a real Bukkit event).
+
+=== 13.11. Common mistakes
+
+[cols="1,2"]
+|===
+|Mistake |Consequence and fix
+
+|Shading `sponge-mixin`, `mixinextras-common`, or `laminate-api`
+|Creates duplicate class definitions in the most sensitive class-loading layer. Keep all three
+`compileOnly` — they are already on the server classpath at runtime.
+
+|Missing `hybrid: true` in `plugin.yml`
+|Laminate treats the jar as an ordinary Bukkit plugin; the `mixins:` key is never read and no
+mixin is ever registered.
+
+|Listing a mixin config in `plugin.yml` but not packaging the matching JSON file
+|`HybridPluginDescriptorReader` verifies every `mixins:` entry exists as a real jar entry;
+bootstrap fails and the whole plugin is disabled (see <<operations,Chapter 12, §12.7>>).
+
+|Forgetting `mixins.<plugin>.generated.json` after adding an `@InjectEvent` mixin
+|The generated companion mixin is compiled into your jar, but never gets registered with the
+Mixin subsystem, so the event silently never fires.
+
+|Referencing Spigot/obfuscated names instead of Mojang-mapped names in `@Mixin` targets
+|Laminate does not remap at runtime; `paperweight-userdev`'s Mojang-mapped NMS classes are what
+the running server actually uses.
+
+|Using `/reload` with the plugin installed
+|Hard-blocked while any hybrid plugin is loaded — restart the server instead (see
+<<operations,Chapter 12, §12.6.2>>).
+
+|Missing a plugin-unique prefix on injected fields/methods
+|SpongePowered Mixin raises a name-collision error at bootstrap if two plugins' mixins add a
+member with the same name to the same target class.
+|===

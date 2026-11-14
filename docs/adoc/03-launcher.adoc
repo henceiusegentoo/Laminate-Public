@@ -1,56 +1,61 @@
 // ============================================================
 [[launcher]]
-== 3. Self-Launching Entry Point
+== 3. The Launcher (`LaminateMain`)
 // ============================================================
 
-Class:: `io.papermc.paper.LaminateLauncher`
-Source:: `paper-server/src/main/java/io/papermc/paper/LaminateLauncher.java`
+Class:: `eu.lschreiber.laminate.launcher.LaminateMain`
+Source:: `laminate-launcher/src/main/java/eu/lschreiber/laminate/launcher/LaminateMain.java`
+
+Related:: `RelaunchHandler`, `PluginArguments` (same package)
 
 === 3.1. Purpose
 
-The Laminate server JAR must be started with two things that ordinary operators do not
-supply:
-
-. `-javaagent:self` — so <<agent,`PaperMixinAgent`>> runs before `main()` and captures
-  the JVM's `Instrumentation` handle.
-. Four `--add-opens` flags — so the Quilt/Knot mixin framework can access sealed JDK
-  packages via reflection.
-
-`LaminateLauncher` eliminates both requirements for the operator.
-It is the `Main-Class` in the distribution JAR's manifest.
-On a first launch (no agent), it relaunches itself with all required flags.
-On the second JVM (agent already ran), it delegates to the Paperclip bundler.
+`LaminateMain` is the `Main-Class` of the merged `laminate-server-<paperVersion>.jar`. Operators
+run this jar with a plain `java -jar laminate-server-<version>.jar [args]` — no manual JVM flags.
+`LaminateMain` is responsible for getting the JVM into the state the rest of the pipeline needs
+(a Java agent attached, `--add-opens` present) before handing off to Paperclip's own entry point,
+and for constructing the exact classloader shape (<<architecture,Chapter 2, section 2.4>>) that
+lets Paperclip's own classes end up parented to Laminate's merged classpath.
 
 === 3.2. Detection mechanism
 
-`PaperMixinAgent.premain()` sets the system property `laminate.agent.loaded` before
-`main()` is called.
-
-`LaminateLauncher.main()` checks for this property:
+`LaminateAgent.premain` (<<agent,Chapter 4>>) sets the system property `laminate.agent.loaded` to
+`"true"` before `main()` is called. `LaminateMain.main()` checks for exactly that value:
 
 [source,java]
 ----
-public static void main(final String[] args) throws Exception {
-    if (System.getProperty(AGENT_LOADED_PROP) != null) {
-        invokeBundlerMain(args);   // agent ran — delegate to Paperclip
+public static void main(String[] args) throws Exception {
+    if (!"true".equals(System.getProperty(AGENT_LOADED_PROPERTY))) {
+        RelaunchHandler.relaunch(args);   // never returns; calls System.exit()
         return;
     }
-    relaunchWithAgent(args);       // first launch — relaunch with flags
+    Instrumentation instrumentation = LaminateAgent.getInstrumentation();
+    // ... build classloaders, run bootstrapHybridMixins(), invoke Bundler-Main-Class ...
 }
 ----
 
-`AGENT_LOADED_PROP = "laminate.agent.loaded"`. The constant is shared between
-`LaminateLauncher` and `PaperMixinAgent` (the latter writes it; the former reads it).
+`AGENT_LOADED_PROPERTY = "laminate.agent.loaded"`, a private constant duplicated (and kept
+manually in sync, per its own javadoc) between `LaminateMain` and `LaminateAgent` — the agent
+writes it, the launcher reads it.
 
-=== 3.3. Relaunch logic (`relaunchWithAgent`)
+=== 3.3. Relaunch logic (`RelaunchHandler.relaunch`)
 
-. Locates the Java executable via `ProcessHandle.current().info().command()`, falling back
-  to `$JAVA_HOME/bin/java`.
-. Locates the running JAR via `LaminateLauncher.class.getProtectionDomain().getCodeSource().getLocation()`.
-. Copies all existing JVM flags from `ManagementFactory.getRuntimeMXBean().getInputArguments()`,
-  stripping any `-javaagent:` entry that points at the same JAR (to avoid a duplicate agent
-  registration) while preserving all other agents (profilers, APM agents, security agents).
-. Appends the four `--add-opens` flags required by Quilt/Knot:
+`RelaunchHandler.relaunch(args)` is a static, side-effecting method that never returns normally
+(it always ends in `System.exit`). It:
+
+. Resolves the `java` executable via `ProcessHandle.current().info().command()`, falling back to
+  `$java.home/bin/java`, so the relaunch uses the exact same JDK/JRE install rather than whatever
+  is first on `PATH`.
+. Resolves this jar's own absolute path via
+  `RelaunchHandler.class.getProtectionDomain().getCodeSource().getLocation()`.
+. Copies every existing JVM input argument from
+  `ManagementFactory.getRuntimeMXBean().getInputArguments()`, stripping only a `-javaagent:` entry
+  that points at this same jar (path-normalized comparison, so relative vs. absolute references to
+  the same file are treated as equal) — every other agent (profilers, APM agents, security agents)
+  is forwarded unchanged.
+. Appends four `--add-opens` flags, unconditionally, on every relaunch — these are *not* eliminated
+  relative to the older forked project; the Quilt/Mixin framework still needs reflective access to
+  sealed JDK internals:
 +
 ----
 --add-opens=java.base/java.lang=ALL-UNNAMED
@@ -58,43 +63,125 @@ public static void main(final String[] args) throws Exception {
 --add-opens=java.base/java.io=ALL-UNNAMED
 --add-opens=java.base/java.util=ALL-UNNAMED
 ----
-. Adds `-javaagent:<selfJar>`.
-. Adds `-jar <selfJar>`.
-. Forwards all application arguments unchanged (`nogui`, `--port`, `--plugins`, etc.).
-. Starts the child process with `ProcessBuilder.inheritIO()` and exits with the child's
-  return code.
+. Appends `-javaagent:<selfJar>`, then `-jar <selfJar>`.
+. Forwards all application arguments (`--nogui`, `--plugins`, `--add-plugin`, ...) verbatim, appended
+  after `-jar <selfJar>`.
+. Spawns the child with `ProcessBuilder.inheritIO()`, blocks on `child.waitFor()`, and calls
+  `System.exit(exitCode)` with the child's own exit code.
 
-=== 3.4. Bundler delegation (`invokeBundlerMain`)
+`RelaunchHandler.buildCommand(...)` (the pure, unit-tested core of the above) takes the java
+executable, self-jar path, existing JVM args, and app args as plain parameters — no I/O, no
+static state — specifically so the command-construction logic is testable without spawning a real
+process.
 
-Reads `Bundler-Main-Class` from the JAR manifest (set to `io.papermc.paperclip.Main` in
-`createLaminateServerJar`) and invokes its `main(String[])` via reflection.
-Using the manifest attribute rather than a hard-coded class name keeps the launcher
-agnostic of the specific bundler implementation.
+=== 3.4. Bundler delegation
 
-=== 3.5. Manifest attributes set by `createLaminateServerJar`
+Once running on a properly configured JVM (`laminate.agent.loaded == "true"`), `LaminateMain`
+reads the `Bundler-Main-Class` attribute from its own `META-INF/MANIFEST.MF` (set to Paperclip's
+original `Main-Class` by `LaminateServerJarTask` at build time — see <<build,Chapter 11>>) and,
+after building the classloaders described below and running Stage A of the hybrid-mixin bootstrap,
+invokes that class's `main(String[])` reflectively through `paperclipLoader`, forwarding `args`
+unchanged. Reading the target class name from the manifest rather than hardcoding it keeps
+`LaminateMain` agnostic of the specific bundler implementation Paper happens to ship.
 
-[cols="1,2"]
+=== 3.5. Classloader construction
+
+`main()` builds two `URLClassLoader`s, both wrapping the same single jar (`LaminateMain`'s own
+`CodeSource` location):
+
+[source,java]
+----
+URLClassLoader bundlerLoader = new URLClassLoader(
+        new URL[] { location }, ClassLoader.getPlatformClassLoader());
+
+URLClassLoader paperclipLoader = new SelfFirstClassLoader(
+        new URL[] { location }, bundlerLoader);
+
+Thread.currentThread().setContextClassLoader(paperclipLoader);
+----
+
+`bundlerLoader` is parented directly to the *platform* classloader (not the thread's system/context
+loader), deliberately bypassing the ordinary application classloader that loaded `LaminateMain`
+itself. `paperclipLoader` is parented to `bundlerLoader`. The full reasoning for why a second,
+*self-first* loader is required here — rather than simply invoking Paperclip through
+`bundlerLoader` directly — is covered in <<architecture,Chapter 2, section 2.4>>: in short,
+Paperclip constructs its own server classloader as
+`new URLClassLoader(urls, Paperclip.class.getClassLoader().getParent())`, and only by making
+`paperclipLoader` (not `bundlerLoader`) be `Paperclip.class.getClassLoader()` does that expression
+evaluate to `bundlerLoader` instead of skipping past it to the platform loader.
+
+=== 3.6. `SelfFirstClassLoader`
+
+A private, static inner class of `LaminateMain`. An ordinary `URLClassLoader` delegates
+parent-first: since `paperclipLoader`'s parent (`bundlerLoader`) has an *identical* classpath (both
+wrap the same one merged jar), plain parent-first delegation would let `bundlerLoader` always win
+every lookup, making `paperclipLoader` a completely inert pass-through — this was confirmed with a
+small isolated reproduction before the class was written, per its own javadoc, not merely reasoned
+about. `SelfFirstClassLoader` instead tries its own classpath first:
+
+[source,java]
+----
+protected synchronized Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+    if (name.startsWith("java.") || name.startsWith("javax.")) {
+        return super.loadClass(name, resolve);   // always defer platform classes to the JDK
+    }
+    Class<?> loadedClass = findLoadedClass(name);
+    if (loadedClass == null) {
+        try {
+            loadedClass = findClass(name);         // try locally first
+        } catch (ClassNotFoundException notFoundLocally) {
+            loadedClass = super.loadClass(name, false);   // fall back to parent-first
+        }
+    }
+    if (resolve) resolveClass(loadedClass);
+    return loadedClass;
+}
+----
+
+The `java.`/`javax.` prefix carve-out exists for two reasons: sealed platform packages would throw
+a `SecurityException` if independently redefined, and — more relevantly for a jar that bundles
+`javax.annotation.*` types transitively — it avoids silently creating a second, non-canonical copy
+of a class that should have a single canonical definition via `bundlerLoader`. Everything else is
+tried locally (`findClass`) before falling back to ordinary parent-first delegation
+(`super.loadClass`), which is exactly what makes `paperclipLoader` the genuine defining loader of
+Paperclip's own classes.
+
+=== 3.7. `bootstrapHybridMixins` (Stage A)
+
+After the context classloader is set to `paperclipLoader` but strictly before `Bundler-Main-Class`
+is invoked, `main()` calls a private helper that parses plugin-related CLI flags
+(`PluginArguments.parse`, below) and runs Stage A of `LaminateRuntimeBootstrap.bootstrap(...)`
+(<<bootstrap,Chapter 5>>). Any `Throwable` escaping this call is caught, logged, and swallowed — a
+failure of the bootstrap mechanism itself must never prevent the server from starting; individual
+hybrid plugin failures are already isolated inside `LaminateRuntimeBootstrap` itself.
+
+=== 3.8. `PluginArguments`
+
+A small, pure-function `record` (`PluginArguments.parse(String[] args)`, no I/O, no static state)
+that extracts the hybrid-plugin-related flags `LaminateMain` needs before forwarding `args`
+unchanged to Paperclip/Paper:
+
+[cols="1,1,3"]
 |===
-|Attribute |Value
+|Flag |Cardinality |Meaning
 
-|`Main-Class`
-|`io.papermc.paper.LaminateLauncher`
+|`--plugins <dir>`
+|single-valued (last occurrence wins)
+|Overrides the default plugin directory (`"plugins"`). Not resolved to an absolute path at parse
+time; resolution against the process's working directory happens only when the path is actually
+used, matching the old fork's own `File`-based default.
 
-|`Bundler-Main-Class`
-|`io.papermc.paperclip.Main`
+|`--add-plugin <file>`
+|repeatable
+|Every occurrence is collected, in the order given — an extra individual plugin jar to scan for a
+hybrid descriptor, outside the plugin directory.
 
-|`Premain-Class`
-|`io.papermc.paper.mixin.PaperMixinAgent`
-
-|`Agent-Class`
-|`io.papermc.paper.mixin.PaperMixinAgent`
-
-|`Can-Retransform-Classes`
-|`true`
-
-|`Can-Redefine-Classes`
-|`true`
+|`--add-plugin-dir <dir>`
+|repeatable
+|Every occurrence is collected, in the order given — an extra directory whose jars should be scanned.
 |===
 
-The same JAR file thus serves triple duty: application entrypoint, Paperclip bundler host,
-and Java agent.
+Any other argument (`--nogui`, `--port`, ...) is left untouched by this parser — it only extracts
+what it recognizes and otherwise leaves `args` for Paperclip/Paper to interpret normally. A
+recognized flag that is the last element of `args` (missing its required value) throws
+`IllegalArgumentException`.

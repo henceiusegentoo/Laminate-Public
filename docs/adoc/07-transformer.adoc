@@ -1,0 +1,104 @@
+// ============================================================
+[[transformer]]
+== 7. The Class-File Transformer (`LaminateMixinTransformer`)
+// ============================================================
+
+`LaminateMixinTransformer`
+(`laminate-runtime/src/main/java/eu/lschreiber/laminate/runtime/LaminateMixinTransformer.java`) is
+a `java.lang.instrument.ClassFileTransformer` — the component the JVM actually calls for every
+class it loads or retransforms, for the lifetime of the process once installed. It is a port of
+the reference fork's `PaperMixinClassFileTransformer`, but with a materially different lifecycle
+described in <<gate-lifecycle>>.
+
+=== 7.1. Installation and exclusions
+
+It is created and registered with `Instrumentation.addTransformer(transformer, true)` by
+`LaminateRuntimeBootstrap.installGateTransformer`, the last act of Stage A (<<bootstrap>>) — before
+any real `IMixinTransformer` exists. The `true` argument requests retransformation capability,
+which `LaminateRuntimeBootstrap`'s safety net (<<bootstrap>>) relies on.
+
+`canTransform(dotName)` gates every call: classes under any of the following prefixes are returned
+untouched, unconditionally, before any bootstrap-state check even runs:
+
+[cols="1,3"]
+|===
+|Prefix |Why excluded
+
+|`org.apache.logging.log4j.`
+|Log4j itself — transforming logging internals is never correct and risks corrupting the logging
+pipeline before it can even report the problem.
+
+|`org.spongepowered.asm.`
+|Sponge Mixin's own internals — the transformer that would be doing the transforming.
+
+|`org.objectweb.asm.`
+|ASM, the bytecode library Mixin is built on.
+
+|`eu.lschreiber.laminate.runtime.`
+|This module's own classes, including this transformer.
+
+|`org.quiltmc.`
+|Quilt-loader.
+
+|`com.llamalad7.mixinextras.`
+|MixinExtras.
+
+|`eu.lschreiber.laminate.bridge.`
+|`laminate-bridge` (<<bridge-and-core-mixins>>).
+
+|`eu.lschreiber.laminate.launcher.`
+|`LaminateMain`/`RelaunchHandler`/`PluginArguments`.
+
+|`eu.lschreiber.laminate.agent.`
+|`LaminateAgent`.
+
+|`eu.lschreiber.laminateapi.`
+|`laminate-api` — excluded defensively in addition to the identity-based `bundlerLoader` check in
+`LaminateRuntimeBootstrap.isGameLoaderCandidate` (<<bootstrap>>): both are defined by
+`bundlerLoader`, so if a future refactor ever caused a `laminateapi` class to be the very first
+class seen after the gate installs, it must not be mistaken for a real game class load.
+|===
+
+Everything else is eligible.
+
+=== 7.2. Two-phase lifecycle
+
+[[gate-lifecycle]]
+Unlike the fork's transformer — which is only ever installed once a real `IMixinTransformer`
+already exists — this transformer is installed *before* one exists, and spends an initial period
+of the process's life as a pure detector with no transforming effect at all.
+
+On every eligible `transform` call, it delegates to
+`LaminateRuntimeBootstrap.transformerForGameLoad(loader)`:
+
+* Before Stage B has triggered: this call is also the mechanism that *decides whether to trigger
+  Stage B right now* (see <<bootstrap>>'s "detecting the game loader" section for the exact
+  check). If it does not trigger (not yet the right loader) or Stage B has already been attempted
+  and failed, `transformerForGameLoad` returns `null`, and `transform` returns `null` too — the
+  class loads completely unmodified, and the JVM proceeds as if no transformer were installed for
+  it.
+* The call that *does* trigger Stage B runs the entire mixin-config-registration/phase-advance
+  sequence synchronously, inside that single `transform` invocation, and returns the freshly
+  obtained `IMixinTransformer`.
+* Every call afterward, for the rest of the process's life, finds `transformerForGameLoad`
+  returning the same cached transformer immediately (a single volatile field read) — the steady
+  state is exactly as cheap as the fork's single-phase design.
+
+Once a real transformer is available (on this call or any later one), `transform` delegates to
+`IMixinTransformer.transformClassBytes(dotName, dotName, classfileBuffer)`, which returns the
+original byte array unchanged if no mixin targets the class, or a new array incorporating the
+woven mixin bytecode otherwise. `transform` returns `null` (meaning "unchanged") whenever the
+returned array is reference-identical to the input, and the transformed bytes otherwise. Any
+`Throwable` thrown during transformation is caught, logged at `ERROR`, and the class is allowed to
+load with its original, untransformed bytes — a single misbehaving mixin can never crash the
+class it targets from loading, let alone crash the server.
+
+=== 7.3. Why this design, not a simpler one
+
+The two-phase design exists purely to satisfy the ordering constraint explained in
+<<bootstrap>>: Sponge Mixin resolves a mixin's target class synchronously and permanently at
+registration time, and in this project registration cannot safely happen until *some* real game
+class is actually loadable. Installing the transformer early and letting it double as both
+"detector" and "gate" means Laminate never needs a second, separate mechanism to watch for the
+right moment — the exact same call the JVM already makes for every class load is reused to decide
+when Stage B may safely run.

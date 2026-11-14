@@ -7,13 +7,7 @@ import org.jetbrains.annotations.NotNull;
 
 import java.util.function.BooleanSupplier;
 
-/**
- * Fired at the very start of each {@code ServerLevel.tick(BooleanSupplier)}
- * call, before any game logic runs for that level.
- *
- * <p>Bridged from NMS via
- * {@code @InjectEvent(method = "tick", at = At.HEAD)}.</p>
- */
+/** Fired at the start of each {@code ServerLevel.tick(BooleanSupplier)} call. */
 public final class ServerLevelTickStartEvent extends Event {
 
     private static final HandlerList HANDLER_LIST = new HandlerList();
@@ -21,39 +15,25 @@ public final class ServerLevelTickStartEvent extends Event {
     private final ServerLevel handle;
     private final BooleanSupplier hasTime;
 
-    /**
-     * Constructor called by the generated Mixin companion class.
-     * Convention: first parameter is the Mixin target ({@code ServerLevel}),
-     * followed by the marker method's parameters in declaration order.
-     *
-     * @param handle  the NMS level that is ticking
-     * @param hasTime supplier indicating whether the server has time budget
-     */
+    /** Called by the generated mixin companion. */
     public ServerLevelTickStartEvent(@NotNull ServerLevel handle,
                                      @NotNull BooleanSupplier hasTime) {
         this.handle = handle;
         this.hasTime = hasTime;
     }
 
-    /** Returns the raw NMS {@code ServerLevel} that is ticking. */
+    /** Returns the ticking NMS level. */
     @NotNull
     public ServerLevel getHandle() {
         return this.handle;
     }
 
-    /**
-     * Returns {@code true} if the server currently has spare time budget
-     * for this tick, exactly as reported by the {@code BooleanSupplier}
-     * passed into {@code ServerLevel.tick()}.
-     */
+    /** Returns whether the server has time budget for this tick. */
     public boolean hasTime() {
         return this.hasTime.getAsBoolean();
     }
 
-    /**
-     * Returns the raw {@link BooleanSupplier} for cases where you need to
-     * defer the check or pass it along.
-     */
+    /** Returns the underlying time-budget supplier. */
     @NotNull
     public BooleanSupplier getHasTimeSupplier() {
         return this.hasTime;

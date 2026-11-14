@@ -1,0 +1,10 @@
+{
+  "required": true,
+  "package": "eu.lschreiber.laminate.mixins.core",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "PluginInitializerManagerMixin",
+    "ReloadCommandMixin",
+    "PaperPluginsCommandMixin"
+  ]
+}

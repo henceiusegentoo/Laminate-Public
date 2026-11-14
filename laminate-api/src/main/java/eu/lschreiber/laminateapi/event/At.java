@@ -1,10 +1,6 @@
 package eu.lschreiber.laminateapi.event;
 
-/**
- * Injection point within the target method body.
- *
- * <p>Maps directly to SpongePowered Mixin's {@code @At} value.</p>
- */
+/** Injection point within the target method body. */
 public enum At {
     /** Before the first instruction. */
     HEAD,

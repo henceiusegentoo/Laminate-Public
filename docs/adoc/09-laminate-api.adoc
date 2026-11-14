@@ -1,0 +1,657 @@
+// ============================================================
+[[laminate-api]]
+== 9. The `laminate-api` Module
+// ============================================================
+
+`laminate-api` (module directory `laminate-api/`) is the library that hybrid plugin
+authors compile against.
+It combines two things in one artifact:
+
+* Annotation processors, run at plugin *compile time*, that generate boilerplate
+  (typed accessor interfaces, companion Mixin classes) from a small set of
+  declarative annotations.
+* Runtime support classes (`LaminateAccessors`, `LaminateEventBridge`) that the
+  generated code calls into, present on the *server's* classpath at run time.
+
+Source: `laminate-api/src/main/java/eu/lschreiber/laminateapi/`.
+
+=== 9.1. Who depends on it, and how
+
+`laminate-api` is an ordinary Gradle (and, once published, Maven) library. Its
+coordinates come from the root `build.gradle.kts`'s `allprojects` block
+(`group = "eu.lschreiber.laminate"`) plus `gradle.properties`'
+`laminateVersion` (currently `0.1.0-SNAPSHOT`) and its own module name:
+
+[source]
+----
+eu.lschreiber.laminate:laminate-api:0.1.0-SNAPSHOT
+----
+
+Within this repository, `test-plugin` (see <<test-plugin,chapter 10>>) consumes it as
+an in-repo project dependency:
+
+[source,kotlin]
+----
+dependencies {
+    compileOnly(project(":laminate-api"))
+    annotationProcessor(project(":laminate-api"))
+}
+----
+
+An external hybrid plugin author (not building inside this repository) would use
+the equivalent published-artifact form once `laminate-api` is published somewhere
+reachable:
+
+[source,kotlin]
+----
+dependencies {
+    compileOnly("eu.lschreiber.laminate:laminate-api:0.1.0-SNAPSHOT")
+    annotationProcessor("eu.lschreiber.laminate:laminate-api:0.1.0-SNAPSHOT")
+}
+----
+
+`laminate-api/build.gradle.kts` applies the `maven-publish` plugin and declares a
+single `MavenPublication` (`from(components["java"])`), but — like the reference
+fork's equivalent block, which it was carried over from unmodified — does not
+declare a publishing repository. Publishing therefore currently only works to
+Gradle's own local Maven cache (`./gradlew publishToMavenLocal`) or to whatever
+`repositories { maven(...) }` block a downstream build adds under `publishing {}`;
+wiring up a real distribution repository is left for a later phase.
+
+At *run time*, `laminate-api`'s classes are not on the hybrid plugin's own
+classpath — a plugin must never shade `laminate-api` into its jar. Instead,
+`laminate-launcher`'s `laminateServerJar` task (see <<build,chapter 11>>) merges
+`laminate-api`'s compiled output directly into the bundled `laminate-server-<version>.jar`,
+so it ends up on the server's own class loader, a *parent* of every plugin's
+`PluginClassLoader`. This asymmetry — compile-time dependency, but *not*
+shaded, because it is already guaranteed present higher up the class-loader chain
+at run time — is exactly what makes the cross-class-loader design described in
+<<event-bridge,9.6>> necessary in the first place.
+
+=== 9.2. Package layout
+
+[cols="1,2"]
+|===
+|Package |Contents
+
+|`eu.lschreiber.laminateapi.accessor`
+|`@GenerateAccessor`, `GenerateAccessorProcessor`, `LaminateAccessors`
+
+|`eu.lschreiber.laminateapi.event`
+|`@InjectEvent`, `At`, `@Rewrite`, `RewriteProcessor`, `InjectEventProcessor`,
+`LaminateEventBridge`
+
+|`eu.lschreiber.laminateapi.internal`
+|`MixinTargetResolver`, `JvmDescriptors` — not part of the public API, shared
+between the two annotation processors
+|===
+
+// ============================================================
+[[generate-accessor]]
+=== 9.3. `@GenerateAccessor` and `GenerateAccessorProcessor`
+// ============================================================
+
+==== 9.3.1. Purpose
+
+A hand-written Mixin class can inject a brand-new method into a Minecraft/Paper
+internal class (e.g. add `write(String)` to `MinecraftServer`), but plugin code
+has no compile-time handle on that injected method — the plugin's own class
+loader never saw a declaration for it. Writing raw reflection or
+`MethodHandles` by hand at every call site is repetitive and easy to get wrong
+(wrong descriptor, wrong lookup, no caching). `@GenerateAccessor` automates
+generating a small, typed interface through which the injected method can be
+called like any ordinary Java method.
+
+==== 9.3.2. The annotation
+
+[source,java]
+----
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface GenerateAccessor {
+    String name() default "";  // accessor method name; defaults to the annotated method's name
+}
+----
+
+Applied to a `@Unique` method inside a `@Mixin` class. Retention is `RUNTIME`
+(not `CLASS`, unlike the event-side annotations) purely as a stylistic
+carry-over from the reference fork — nothing in `laminate-api` currently reads
+`@GenerateAccessor` reflectively at run time; all of its processing happens at
+compile time in `GenerateAccessorProcessor`.
+
+==== 9.3.3. `GenerateAccessorProcessor`
+
+`@SupportedAnnotationTypes("eu.lschreiber.laminateapi.accessor.GenerateAccessor")`,
+`@SupportedSourceVersion(SourceVersion.RELEASE_21)`.
+
+For every `@GenerateAccessor`-annotated method found in a round:
+
+. Resolves the accessor method name: the annotation's `name()` if non-blank and a
+  valid, non-keyword Java identifier (checked with `SourceVersion.isIdentifier`/
+  `isKeyword`), otherwise the annotated method's own simple name. An invalid
+  explicit `name()` is a compile-time error.
+. Erases the method's return type and parameter types (via
+  `Types#erasure`), and assigns each parameter the positional name `p0`, `p1`, …
+  so the generated interface compiles whether or not `-parameters` was passed to
+  `javac`.
+. Groups all entries by their enclosing mixin class, and resolves each mixin
+  class's single `@Mixin` target once via
+  `MixinTargetResolver.resolve(mixinClass, processingEnv, "@GenerateAccessor")`
+  (see <<internal-utils,9.7>>).
+. For each mixin class with at least one entry, emits one accessor interface.
+
+==== 9.3.4. Accessor package derivation
+
+[source,java]
+----
+static String deriveAccessorPackage(final String mixinPackage) {
+    if (mixinPackage.isEmpty()) {
+        return "accessor";
+    }
+    final int lastDot = mixinPackage.lastIndexOf('.');
+    if (lastDot < 0) {
+        return "accessor";
+    }
+    return mixinPackage.substring(0, lastDot) + ".accessor";
+}
+----
+
+Example: `eu.lschreiber.testplugin.mixins` → `eu.lschreiber.testplugin.accessor`.
+The accessor lands in a *sibling* `.accessor` package, never inside the mixin
+package itself — SpongePowered Mixin refuses to let classes that live in a
+registered mixin package be loaded directly by the application class loader, so
+placing the accessor one package over avoids that restriction entirely.
+
+==== 9.3.5. Generated interface shape
+
+For `ServerMixin` (targeting `MinecraftServer`, one `@GenerateAccessor(name = "write")`
+method — see <<test-plugin,chapter 10>>), the processor writes
+`eu.lschreiber.testplugin.accessor.MinecraftServerAccessor`:
+
+[source,java]
+----
+package eu.lschreiber.testplugin.accessor;
+
+import eu.lschreiber.laminateapi.accessor.LaminateAccessors;
+
+/**
+ * Generated by {@link eu.lschreiber.laminateapi.accessor.GenerateAccessorProcessor}.
+ * Do not edit manually.
+ */
+public interface MinecraftServerAccessor {
+
+    void write(String p0);
+
+    static MinecraftServerAccessor of(Object target) {
+        return LaminateAccessors.create(
+            MinecraftServerAccessor.class, target,
+            new String[]{"write", "testPlugin$write"});
+    }
+}
+----
+
+The `of(Object)` factory bakes in a flat `[accessorName, mixinMethodName, ...]`
+mapping array — here `write` (the public accessor name) maps to
+`testPlugin$write` (the actual `@Unique` mixin method name) — and hands it to
+`LaminateAccessors.create`.
+
+// ============================================================
+[[laminate-accessors]]
+=== 9.4. `LaminateAccessors`
+// ============================================================
+
+Class:: `eu.lschreiber.laminateapi.accessor.LaminateAccessors`
+
+The runtime half of the accessor system. Generated `of(Object)` factories call
+`LaminateAccessors.create(accessorInterface, target, methodMappings)`, which:
+
+. Validates `accessorInterface`, `target`, and `methodMappings` are non-null and
+  that `methodMappings` has an even length (throws `IllegalArgumentException`
+  otherwise).
+. Builds an immutable `Map<String,String>` (accessor name → mixin method name)
+  from the flat mapping array.
+. Looks up (or creates) a per-target-class `ConcurrentHashMap<String, MethodHandle>`
+  from a process-global `ConcurrentHashMap<Class<?>, ...>` cache, keyed on
+  `target.getClass()`.
+. Pre-resolves and caches a `MethodHandle` for every interface method up front
+  (`populateHandles`), so the proxy's invocation handler never hits a cold
+  lookup at call time.
+. Returns a JDK dynamic `Proxy` implementing `accessorInterface`, backed by a
+  private `AccessorInvocationHandler` record.
+
+`MethodHandle` resolution (`obtainLookup` / `resolveHandle`) uses
+`MethodHandles.privateLookupIn(targetClass, MethodHandles.lookup())` for the
+widest possible access, falling back to the plain public lookup if that throws
+`IllegalAccessException`. It then walks the target class's full superclass
+chain (`cls = cls.getSuperclass()` until `null`), matching by method name and
+exact erased parameter types, and unreflects the first match found
+(`method.setAccessible(true)` then `lookup.unreflect(method)`).
+
+The invocation handler routes `Object` methods (`toString`/`hashCode`/`equals`)
+to safe proxy-local defaults and everything else through the cached handle:
+
+[source,java]
+----
+return handle.invokeWithArguments(prependTarget(target, args));
+----
+
+`prependTarget` puts the mixin-injected target object as argument 0, because an
+unreflected `MethodHandle` for an instance method expects the receiver as its
+first argument. A missing handle at invocation time (mixin not active, or a
+mismatched descriptor) throws a descriptive `IllegalStateException` rather than
+a bare `NullPointerException`.
+
+// ============================================================
+[[inject-event]]
+=== 9.5. `@InjectEvent`, `At`, `@Rewrite`, and `InjectEventProcessor`
+// ============================================================
+
+==== 9.5.1. Purpose
+
+Plugin authors frequently want to fire a Bukkit event from inside an NMS method
+body — e.g. "fire `ServerLevelTickStartEvent` at the top of
+`ServerLevel.tick(...)`". Hand-writing the companion Mixin class for this every
+time is repetitive and easy to get subtly wrong (wrong `@At`, wrong descriptor,
+forgetting to register the generated config in `plugin.yml`). `@InjectEvent`
+expresses the intent declaratively on a marker method; the processor generates
+the real Mixin class.
+
+==== 9.5.2. `At` — injection point
+
+`eu.lschreiber.laminateapi.event.At` is a plain four-value enum that maps
+directly onto SpongePowered Mixin's own `@At` value string:
+
+[cols="1,3"]
+|===
+|Value |Meaning
+
+|`HEAD`
+|Before the first instruction in the target method.
+
+|`TAIL`
+|Just before every `RETURN` in the target method.
+
+|`RETURN`
+|Immediately before each `RETURN` opcode (in practice the same set of injection
+points as `TAIL`).
+
+|`INVOKE`
+|Before a specific method call inside the target method; requires
+`@InjectEvent#target()` to name the call site descriptor.
+|===
+
+==== 9.5.3. `@Rewrite` — type-safe method descriptor
+
+[source,java]
+----
+@Target({})
+@Retention(RetentionPolicy.CLASS)
+public @interface Rewrite {
+    String method();
+    Class<?> returns() default void.class;
+    Class<?>[] args() default {};
+}
+----
+
+An alternative to writing a raw JVM descriptor string by hand, used as the
+value of `InjectEvent#methodRewrite()`. `RewriteProcessor.toDescriptor(Rewrite)`
+(package-private, in `eu.lschreiber.laminateapi.event`) converts it into the
+descriptor Mixin's `@Inject(method = ...)` expects, resolving each `Class<?>`
+via `JvmDescriptors` (see <<internal-utils,9.7>>). It transparently handles
+both the runtime case (a real `Class<?>` is readable) and the
+annotation-processing case, where reading a `Class<?>`-typed annotation member
+throws `MirroredTypeException`/`MirroredTypesException` and the `TypeMirror`
+must be pulled from the exception instead. Examples straight from its javadoc:
+
+[cols="2,3"]
+|===
+|`@Rewrite(...)` |Produced descriptor
+
+|`@Rewrite(method = "tick")`
+|`tick()V`
+
+|`@Rewrite(method = "tick", args = BooleanSupplier.class)`
+|`tick(Ljava/util/function/BooleanSupplier;)V`
+
+|`@Rewrite(method = "hasChunkAt", returns = boolean.class, args = BlockPos.class)`
+|`hasChunkAt(Lnet/minecraft/core/BlockPos;)Z`
+
+|`@Rewrite(method = "getChunkSource", returns = ServerChunkCache.class)`
+|`getChunkSource()Lnet/minecraft/server/level/ServerChunkCache;`
+|===
+
+==== 9.5.4. `@InjectEvent` annotation
+
+[source,java]
+----
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.CLASS)
+public @interface InjectEvent {
+    String method() default "";
+    Rewrite methodRewrite() default @Rewrite(method = "");
+    At at();
+    Class<?> event();
+    boolean cancellable() default false;
+    String target() default "";
+}
+----
+
+Exactly one of `method()` (a simple name, which lets Mixin match any overload,
+or a full hand-written JVM descriptor) and `methodRewrite()` must be set;
+`InjectEventProcessor` throws `IllegalArgumentException` (surfaced as a
+compile-time error against the annotated method) if both or neither are
+present. `target()` is required, and only consulted, when `at() == At.INVOKE`.
+`@Retention(CLASS)` — like `@Rewrite` — because neither annotation needs to
+survive to run time: both are fully consumed during annotation processing, and
+only the *generated* companion class remains in the compiled plugin jar.
+
+==== 9.5.5. What `InjectEventProcessor` generates
+
+For each `@InjectEvent`-annotated marker method, the processor:
+
+. Resolves the enclosing class's `@Mixin` target via `MixinTargetResolver`.
+. Builds the JVM method descriptor (from `method()` directly, or via
+  `RewriteProcessor.toDescriptor` for `methodRewrite()`).
+. Resolves the `event()` class (again handling `MirroredTypeException`), and —
+  if `cancellable = true` but the event class does not implement
+  `org.bukkit.event.Cancellable` — emits a compiler *warning* (not an error).
+. Writes a companion Mixin source file named
+  `{TargetSimpleName}InjectEvent_{sanitizedMarkerMethodName}` (`$` and `.` in the
+  marker method's name are replaced with `_`) in the same package as the mixin
+  class, containing a single `@Inject`-annotated method.
+. Registers that generated class name against a mixin config filename derived
+  from the mixin package (`resolveConfigFileName`): a trailing `.mixins` or
+  `.mixin` package segment is stripped, and the remaining last segment becomes
+  the identifier — `eu.lschreiber.testplugin.mixins` →
+  `mixins.testplugin.generated.json`.
+. Once the final annotation-processing round is reached
+  (`roundEnv.processingOver()`), writes one Mixin JSON config resource per
+  distinct target filename, listing every companion class generated for it (with
+  a shared `"package"` field when every entry shares one package). A
+  `FilerException` from an incremental-build re-run (the resource already
+  exists) is swallowed silently rather than failing the build.
+
+The developer must add that generated filename to `plugin.yml`'s `mixins` list
+once, alongside any hand-written mixin config:
+
+[source,yaml]
+----
+mixins:
+  - mixins.testplugin.json
+  - mixins.testplugin.generated.json
+----
+
+==== 9.5.6. Generated companion class — actual shape
+
+For `testPlugin$onTick` (see <<test-plugin,chapter 10>>, `at = At.HEAD`,
+non-cancellable), the processor emits (paraphrased from
+`InjectEventProcessor#writeCompanionMixin`):
+
+[source,java]
+----
+package eu.lschreiber.testplugin.mixins;
+
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+/** Generated by InjectEventProcessor. Do not edit. */
+@Mixin(targets = "net.minecraft.server.level.ServerLevel")
+abstract class ServerLevelInjectEvent_testPlugin_onTick {
+
+    @Inject(method = "tick", at = @At("HEAD"), cancellable = false)
+    private void laminate$injectEvent_ServerLevelInjectEvent_testPlugin_onTick(
+            BooleanSupplier hasTime, CallbackInfo ci) {
+        eu.lschreiber.laminateapi.event.LaminateEventBridge.fire(
+            "eu.lschreiber.testplugin.events.ServerLevelTickStartEvent", (Object)(Object)this,
+            new Object[]{hasTime});
+    }
+}
+----
+
+When `cancellable = true`, the generated body instead calls `fireAndReturn`,
+casts its result, and cancels the callback if the event was cancelled — see
+<<event-bridge,9.6>> for exactly why that cast is required and why it is safe
+here even though it would not be safe inside `LaminateEventBridge` itself:
+
+[source,java]
+----
+org.bukkit.event.Event _event = (org.bukkit.event.Event)
+    eu.lschreiber.laminateapi.event.LaminateEventBridge.fireAndReturn(
+        "eu.lschreiber.testplugin.events.ServerLevelTickStartEvent", (Object)(Object)this, extraArgs);
+if (_event instanceof org.bukkit.event.Cancellable
+        && ((org.bukkit.event.Cancellable) _event).isCancelled()) {
+    ci.cancel();
+}
+----
+
+// ============================================================
+[[event-bridge]]
+=== 9.6. `LaminateEventBridge` — bridging the launcher/server class-loader split
+// ============================================================
+
+Class:: `eu.lschreiber.laminateapi.event.LaminateEventBridge`
+
+This is the single most subtle piece of `laminate-api`, and it is worth
+understanding precisely rather than by analogy with the reference fork.
+
+==== 9.6.1. The class-loader problem
+
+Generated companion Mixin classes (<<inject-event,9.5>>) get woven directly
+into NMS classes such as `ServerLevel`. Those NMS classes are loaded by the
+server's own game class loader — this project calls it `serverLoader`
+(`eu.lschreiber.laminate.runtime.LaminateQuiltLauncher`) — which cannot see
+classes defined only inside a plugin jar, loaded by a child `PluginClassLoader`.
+A direct `new ServerLevelTickStartEvent(...)` compiled straight into the
+injected bytecode would throw `NoClassDefFoundError` the moment the JVM tries
+to resolve it. `LaminateEventBridge` exists to let injected NMS bytecode fire a
+plugin-defined event *by name*, without ever holding a static reference to the
+plugin's class.
+
+==== 9.6.2. Why it is a problem for `LaminateEventBridge` too — not just for the event class
+
+It would be easy to assume the fix is simply "keep `LaminateEventBridge` off
+the plugin class loader and resolve the *event* class reflectively" — but
+that alone is not enough, and the reason is specific to *where*
+`LaminateEventBridge` itself lives.
+
+`LaminateEventBridge` ships as part of `laminate-api`, which
+`laminate-launcher`'s bundling task (<<build,chapter 11>>) merges directly into
+the launcher jar. It is therefore defined by `bundlerLoader` — the *parent* of
+`serverLoader`, not a peer of it. In the reference fork, by contrast, the
+equivalent bridge class sits directly on the server's own single, flat
+classpath, as a peer of the Bukkit API classes it calls — so a plain static
+reference to `org.bukkit.event.Event` compiles and links there without issue.
+
+In this project's launcher/server split, it does not: Java class loading
+delegates *upward*, never downward, so a parent class loader can never resolve
+a class only its child defines. Concretely, that means *any* compile-time
+reference to an `org.bukkit.*` type anywhere in `LaminateEventBridge`'s own
+bytecode — a field's declared type, a method's declared parameter or return
+type, a cast, an `instanceof` check — fails to link with `NoClassDefFoundError`
+the instant the JVM needs to resolve it, regardless of whether that particular
+code path is actually reached at run time. The class's own javadoc records
+that this was not a hypothetical worry: an earlier version of the class
+crashed with exactly this error, thrown from its `loadEventClass` method, the
+first time a real `@InjectEvent` mixin fired on a live server.
+
+The fix: `LaminateEventBridge` contains *zero* static references to any
+`org.bukkit.*` type. Every interaction with the Bukkit API — `Bukkit.getPluginManager()`,
+`PluginManager#getPlugins()`, `PluginManager#callEvent(Event)`,
+`Bukkit.getLogger()` — is resolved reflectively, and crucially, resolved
+through `target`'s own defining class loader (`target.getClass().getClassLoader()`,
+in practice `serverLoader`, which — unlike `bundlerLoader` — genuinely does have
+the Bukkit API on its own classpath, bundled together with the NMS classes in
+Paper's own server jar), never through `LaminateEventBridge`'s own defining
+loader.
+
+==== 9.6.3. `fire` and `fireAndReturn`
+
+[source,java]
+----
+public static void fire(String eventClassName, Object target, Object... extraArgs)
+
+public static Object fireAndReturn(String eventClassName, Object target, Object... extraArgs)
+----
+
+Both delegate to the same private `constructAndFire` implementation. Note that
+`fireAndReturn`'s declared return type is `Object`, *not* `org.bukkit.event.Event`
+— for exactly the reason above: declaring it as `Event` would itself be a
+static reference to an `org.bukkit.*` type in `LaminateEventBridge`'s own
+bytecode, and would reintroduce the same `NoClassDefFoundError`. Its javadoc
+spells out the consequence for callers: generated `cancellable = true`
+companions (<<inject-event,9.5.6>>) must cast the result themselves — which
+*is* safe in their context, because that generated bytecode is merged into the
+mixin's *target* class (e.g. `ServerLevel`), not into `LaminateEventBridge`,
+and `ServerLevel`'s own defining loader (`serverLoader`) genuinely does have
+`org.bukkit.event.Event` on its classpath.
+
+`constructAndFire`:
+
+. Resolves a `BukkitHandle` (a private record holding the live
+  `PluginManager` instance plus `Method` handles for `getPlugins` and
+  `callEvent`, and a `Logger` — all typed as `Object`/`Method`/`Logger`, never
+  as an `org.bukkit.*` type) for `target.getClass().getClassLoader()`, caching
+  it in a `ConcurrentHashMap<ClassLoader, BukkitHandle>`.
+. Resolves the event class's constructor via `resolveConstructor`, which:
+  .. Builds a cache key from the event FQN plus the runtime types of `target`
+     and every extra argument.
+  .. On a cache miss, asks every currently registered plugin's own class
+     loader (`plugin.getClass().getClassLoader().loadClass(eventClassName)`) to
+     load the event class, stopping at the first success.
+  .. Scans `eventClass.getDeclaredConstructors()` for one whose parameter
+     types are all compatible with the runtime argument types — compatibility
+     allows `null` to match any non-primitive parameter, exact
+     `isAssignableFrom`, and primitive↔boxed equivalence via a small
+     `BOXED_TO_PRIMITIVE` table.
+  .. Caches the match (`Constructor#setAccessible(true)` first), or, if no
+     class/constructor could be resolved, caches a shared sentinel
+     (`UNRESOLVED_SENTINEL = Object.class.getDeclaredConstructor()`) so a
+     permanently-unresolvable event is not re-attempted on every subsequent
+     tick.
+. Instantiates the event (`target` prepended to `extraArgs` as constructor
+  arguments), invokes `callEvent` reflectively on the resolved `PluginManager`,
+  and returns the event instance (or `null` if any step failed).
+
+Both caches (`CACHE` for constructors, `BUKKIT_HANDLES` for per-loader Bukkit
+handles) are `ConcurrentHashMap`s; the class's javadoc notes population is
+idempotent, so a race between threads populating the same key merely causes a
+redundant lookup, never a correctness problem.
+
+One further detail worth flagging: the single failure-path log call inside
+`resolveBukkitHandle` uses plain `System.out.println`, not
+`java.lang.System.Logger` — the class's own comment explains this was a
+deliberate choice after `System.Logger` output was found (later in this
+project's history) to be silently invisible in the running server's log file
+(see `eu.lschreiber.laminate.bridge.LaminateLog`'s javadoc for the full
+story). Because that call site is rare (it only fires when Bukkit API
+resolution itself fails) and `LaminateEventBridge` is a plugin-author-facing
+library, the fix is inlined directly rather than pulling in a dependency on
+the internal `laminate-bridge` module just for one log line.
+
+// ============================================================
+[[internal-utils]]
+=== 9.7. Internal utilities
+// ============================================================
+
+==== 9.7.1. `MixinTargetResolver`
+
+Class:: `eu.lschreiber.laminateapi.internal.MixinTargetResolver`
+
+Shared by both `GenerateAccessorProcessor` and `InjectEventProcessor` to avoid
+duplicating `@Mixin`-target resolution logic. Given a mixin `TypeElement`,
+walks its annotation mirrors looking for `org.spongepowered.asm.mixin.Mixin`,
+and supports both forms Mixin itself allows:
+
+* `@Mixin(SomeClass.class)` — reads the `value` attribute (`List<AnnotationValue>`
+  of `TypeMirror`s), takes the first entry, resolves it to a `TypeElement`.
+* `@Mixin(targets = "com.example.SomeClass")` — reads the `targets` attribute
+  (`List<AnnotationValue>` of strings, with `/`-separated internal names
+  normalized to `.`), takes the first entry, and derives the simple name from
+  the last `.`-segment.
+
+Emits a compile-time error (via the shared `Messager`, tagged with the calling
+annotation's name for context) if more than one target is declared — neither
+processor supports multi-target mixins — or if no `@Mixin` annotation is found
+at all. Returns an immutable `MixinTarget(String simpleName, String fqn)`
+record, or `null` on failure (callers are expected to have already emitted a
+diagnostic in that case).
+
+==== 9.7.2. `JvmDescriptors`
+
+Class:: `eu.lschreiber.laminateapi.internal.JvmDescriptors`
+
+Converts Java types into JVM type-descriptor strings, in both directions a
+processor needs them:
+
+[source,java]
+----
+public static String fromClass(Class<?> type)          // runtime Class, e.g. from reflection
+public static String fromTypeMirror(TypeMirror mirror)  // compile-time TypeMirror
+----
+
+[cols="1,1"]
+|===
+|Java type |JVM descriptor
+
+|`void` |`V`
+|`boolean` |`Z`
+|`byte` |`B`
+|`char` |`C`
+|`short` |`S`
+|`int` |`I`
+|`long` |`J`
+|`float` |`F`
+|`double` |`D`
+|array |`[` + component descriptor
+|reference |`L` + binary name with `/` separators + `;`
+|===
+
+`fromTypeMirror`'s `binaryName` helper recurses through enclosing
+`TypeElement`s so nested/inner classes use `$` rather than `.` as the
+separator in the binary name — e.g. `java.util.Map.Entry` becomes
+`java/util/Map$Entry` in the descriptor, matching what the JVM (and Mixin's
+own `@Inject(method = ...)` parser) actually expects.
+
+// ============================================================
+[[api-tests]]
+=== 9.8. Unit test suite
+// ============================================================
+
+`laminate-api` carries its own JUnit 5 test suite (`laminate-api/src/test/java/`,
+run via `useJUnitPlatform()`, using AssertJ for assertions and Mockito available
+though not exercised by every test class) rather than relying solely on the
+end-to-end `test-plugin` build to catch regressions:
+
+[cols="1,2"]
+|===
+|Test class |Covers
+
+|`GenerateAccessorProcessorTest`
+|`deriveAccessorPackage`'s package-derivation logic across empty, single-segment,
+and multi-segment mixin packages.
+
+|`LaminateAccessorsTest`
+|`create`'s null/validation guards (null interface, null target, null mappings,
+odd-length mappings array) and proxy behaviour.
+
+|`AtTest`
+|`At`'s four values and that `name()` matches the exact strings Mixin's own
+`@At` expects.
+
+|`InjectEventProcessorTest`
+|`isVoidReturn`'s descriptor parsing (void descriptors, non-void descriptors,
+and the bare-method-name-defaults-to-void fallback).
+
+|`JvmDescriptorsTest`
+|`fromClass`'s primitive, array, and reference-type mappings.
+|===
+
+These are pure unit tests of the processors' static helper logic (string/name
+manipulation, descriptor parsing) — they do not spin up a real `javac`
+annotation-processing round or a live server — but they pin down exactly the
+kind of small, easy-to-get-wrong string-manipulation bugs (off-by-one package
+derivation, wrong descriptor characters) that would otherwise only surface as a
+confusing compile failure or `NoSuchMethodError` deep inside a hybrid plugin
+build.

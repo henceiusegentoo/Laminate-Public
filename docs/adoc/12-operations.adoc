@@ -1,0 +1,228 @@
+// ============================================================
+[[operations]]
+== 12. Operator and Author Guidance
+// ============================================================
+
+This chapter is the practical, day-to-day companion to the architecture chapters: how to run a
+Laminate server, where hybrid plugins go, what the console tells you, and how `/plugins` and
+`/reload` differ from vanilla Paper once a hybrid plugin is present.
+
+=== 12.1. What you're running
+
+Laminate ships as a single file: `laminate-server-<mcversion>.jar` (for example
+`laminate-server-1.21.11.jar`). It is built by the Laminate maintainers, not compiled by
+operators — you download or receive the jar and run it directly, exactly as you would an
+official Paper build.
+
+Under the hood, that jar is an **unmodified, official Paper build**, downloaded and
+sha256-verified from papermc.io's Fill v3 API at *build* time (by the maintainers' Gradle build,
+not by your server at startup), merged together with Laminate's launcher, mixin runtime, and
+always-on core mixins into one bootable jar. No Paper source is patched or forked anywhere in
+this pipeline. Operationally this means: everything you already know about running Paper —
+`server.properties`, `eula.txt`, `bukkit.yml`/`spigot.yml`/`paper-global.yml`, world folders,
+`plugins/` — applies unchanged. The differences described in this chapter are additive.
+
+=== 12.2. Minimum requirements
+
+[cols="1,2"]
+|===
+|Requirement |Detail
+
+|Java version
+|Java 25 or later (required by the bundled Paper `26.x` build and by Laminate's mixin/Quilt Loader
+runtime).
+
+|Launch command
+|`java -jar laminate-server-<mcversion>.jar nogui` — no additional JVM flags needed. See
+<<relaunch,§12.3>> for why.
+
+|Plugin directory
+|The standard Paper `plugins/` directory. Hybrid plugins are discovered alongside ordinary
+Bukkit/Paper plugins — there is no separate directory for them.
+|===
+
+=== 12.3. Starting the server
+
+First launch behaves exactly like vanilla Paper: it writes `eula.txt` and exits until you set
+`eula=true`; after that it generates the usual configuration files and world.
+
+[[relaunch]]
+==== 12.3.1. The self-relaunch mechanism
+
+The bundled entry point, `LaminateMain`, needs two things that a plain `java -jar` invocation
+does not provide on its own: the Laminate Java agent attached (`-javaagent:`, so
+`LaminateAgent#premain` can capture the JVM's `Instrumentation` handle before `main()` runs) and
+four `--add-opens` flags that SpongePowered Mixin/Quilt Loader need to reflectively access sealed
+JDK internals:
+
+----
+--add-opens=java.base/java.lang=ALL-UNNAMED
+--add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+--add-opens=java.base/java.io=ALL-UNNAMED
+--add-opens=java.base/java.util=ALL-UNNAMED
+----
+
+`LaminateMain.main` checks a system property (`laminate.agent.loaded`) that only the agent sets.
+On a plain `java -jar laminate-server-<mcversion>.jar` invocation that property is absent, so
+`LaminateMain` hands off to `RelaunchHandler`, which builds the command above (plus
+`-javaagent:<self>` and `-jar <self>`), forwards every existing JVM input argument (heap size,
+`-D` system properties, other `-javaagent` entries such as profilers — all preserved unchanged;
+only a self-referential `-javaagent:` pointing at this same jar is stripped, to avoid loading the
+agent twice) and every application argument (`nogui`, `--plugins`, ...) unchanged, spawns the
+child with inherited stdio, waits for it, and exits with the child's exit code. The child starts
+with the agent already loaded, skips the relaunch check, and proceeds straight to booting Paper.
+
+Practically: an operator never has to pass `--add-opens` or `-javaagent` themselves — this is
+verified against the actual launcher source, not just documented policy. The one thing worth
+knowing is that a short-lived **parent process spawns a child process** that does the real work;
+stdio (console input/output) and the exit code are transparently forwarded, so interactively —
+and for typical `stdin`-piped process supervisors (systemd with `Type=simple`, Docker, screen,
+tmux) — it behaves indistinguishably from a single process. If your tooling inspects the PID it
+launched and expects it to *be* the JVM running the Minecraft server (e.g. sending a JVM-level
+signal, or pattern-matching arguments on that exact PID from `ps`), be aware the real server is
+running in a distinct child PID; the parent's own console banner (`[Laminate] relaunching with
+agent + JVM flags` and the exact command line) is printed before the handoff if you need to
+confirm it happened.
+
+=== 12.4. Plugin discovery: directory and CLI flags
+
+Hybrid plugin jars live in exactly the same directory as ordinary Bukkit/Paper plugin jars — a
+plain `.jar` in `plugins/` is scanned the same way regardless of whether it turns out to declare
+`hybrid: true`. Three CLI flags control which paths are scanned:
+
+[cols="1,3"]
+|===
+|Flag |Behavior
+
+|`--plugins <dir>`
+|Overrides the default plugin directory (`plugins`, resolved against the working directory) that
+is scanned for both ordinary plugin loading and hybrid mixin discovery. If given more than once,
+the last occurrence wins.
+
+|`--add-plugin <file>`
+|Adds a single, individual out-of-tree plugin jar. Repeatable — every occurrence is collected.
+
+|`--add-plugin-dir <dir>`
+|Adds an entire additional directory to scan for plugin jars, on top of the default/`--plugins`
+directory. Repeatable.
+|===
+
+These flag names mirror Paper's own equivalent options, so a jar added via `--add-plugin` or
+`--add-plugin-dir` is both loaded by Paper as an ordinary plugin *and* scanned by Laminate for a
+hybrid descriptor — the two stay in sync, and mixin support is not limited to files physically
+inside `plugins/`. Internally, all resolved paths (default directory, `--add-plugin` files,
+`--add-plugin-dir` directories) are normalized to absolute paths and de-duplicated into a single
+set before being scanned for `plugin.yml`/`hybrid: true`.
+
+=== 12.5. What you'll see on startup
+
+Very early in boot — before Paper itself has logged anything — you'll see plain, unformatted
+console lines from the launcher and runtime confirming the agent attached and that hybrid plugin
+discovery ran:
+
+----
+[Laminate] agent loaded, Instrumentation available
+[Laminate] hybrid mixin bootstrap Stage A complete: 0 plugin(s) failed reading their descriptor;
+mixin config registration (any hybrid plugins found, plus laminate-core-mixins' own always-on
+config) is deferred to Stage B, triggered lazily by the first real game class load.
+----
+
+(Discovery and mixin bytecode registration happen in two internal stages so that mixin target
+classes are only resolved once Paper's real classes are actually loadable; this is a boot-order
+detail, not something you need to act on.) A little later, once Paper's own logger is active and
+plugins are being loaded, a summary line lists every hybrid plugin whose mixins were
+successfully applied — in the same style as vanilla's own "Paper plugins"/"Bukkit plugins"
+counts:
+
+----
+[16:23:45 INFO]: [Laminate] Laminate plugins (1):
+ - test-plugin (0.1.0-SNAPSHOT)
+----
+
+If no hybrid plugin is present, this line is simply omitted. If a plugin's descriptor or mixin
+registration failed, you'll instead see a `WARNING`-level line identifying it by name and jar
+path (see <<failed-bootstrap,§12.7>>).
+
+=== 12.6. `/plugins` and `/reload` with hybrid plugins active
+
+==== 12.6.1. `/plugins`
+
+`/plugins` shows vanilla Paper's usual "Paper Plugins" and "Bukkit Plugins" categories unchanged,
+followed by one additional line for successfully loaded hybrid plugins:
+
+----
+Laminate Plugins (1): test-plugin
+----
+
+Names are listed case-insensitively sorted, comma-separated, in a distinct color. Only hybrid
+plugins whose mixin bootstrap actually *succeeded* appear here — a hybrid plugin that failed to
+bootstrap is culled before Paper's plugin manager ever sees it (<<failed-bootstrap,§12.7>>), so it
+shows up in neither the vanilla categories nor this line.
+
+==== 12.6.2. `/reload`
+
+`/reload` (and `/reload confirm`) is hard-blocked while any hybrid plugin is loaded. Instead of
+reloading, the command broadcasts two messages and does nothing:
+
+----
+Reloading the server while hybrid plugins are loaded is not supported
+Consider restarting the server instead. Reload cancelled
+----
+
+This is enforced unconditionally at the top of the command's execution — vanilla's own reload
+logic never runs. The reason is architectural, not a policy choice: Mixin bytecode
+transformations are woven into the JVM's loaded classes and cannot be undone or re-applied once
+the process is running, so a `/reload` that swaps out plugins or configs would leave hybrid
+plugins' transformed code in an inconsistent state relative to the rest of the server. A full
+restart is the only supported way to pick up new or changed hybrid plugin mixins.
+
+[[failed-bootstrap]]
+=== 12.7. When a hybrid plugin fails to bootstrap
+
+A hybrid plugin's mixin bootstrap can fail for a few concrete reasons, all enforced while reading
+its descriptor out of `plugin.yml`:
+
+[cols="1,2"]
+|===
+|Failure |Cause
+
+|Missing or blank `name`
+|`plugin.yml` declares `hybrid: true` but has no usable plugin name.
+
+|Empty or absent `mixins` list
+|`hybrid: true` was set but no mixin configuration files were declared.
+
+|A listed mixin config does not exist in the jar
+|An entry in `mixins:` does not correspond to a real file packaged inside the plugin jar.
+
+|`plugin.yml` is not a YAML mapping
+|The file parses to something other than a key/value document at its root.
+
+|Mixin config registration itself fails
+|The descriptor was well-formed, but registering its Mixin JSON configs with the Mixin subsystem
+threw (for example, a target class that no longer matches the running Paper version).
+|===
+
+None of these crash the server. The plugin's name is recorded as failed, and — right after Paper
+itself scans all plugin jars — a core mixin removes any provider entry matching a failed plugin's
+name from every registered provider storage, before Paper ever initializes it. The server
+continues starting normally; the broken plugin is simply absent, as if it had never been placed
+in `plugins/`. Look for a `WARNING`-level console line naming the plugin and its jar path to
+diagnose why.
+
+[[updating-paper]]
+=== 12.8. Updating Paper (maintainer workflow)
+
+Unlike the old forked-source approach this project replaces, keeping a Laminate build current
+with upstream Paper does **not** involve manually merging a newer Paper source tree. As a
+maintainer, updating Paper is:
+
+. Bump `paperVersion` (and, if pinning an exact build rather than tracking the latest available
+  one, `paperBuild`) in the root `gradle.properties`.
+. Rebuild.
+
+That's the entire mechanics from a maintainer's perspective — the build downloads and
+sha256-verifies the matching official Paper build at build time and re-merges it with Laminate's
+launcher/runtime/core-mixins into a new `laminate-server-<mcversion>.jar`. See
+<<build,Chapter 11>> for how the Gradle task that performs the download and merge actually works
+internally.

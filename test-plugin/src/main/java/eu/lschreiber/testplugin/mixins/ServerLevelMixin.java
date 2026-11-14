@@ -12,10 +12,7 @@ import java.util.function.BooleanSupplier;
 @Mixin(ServerLevel.class)
 public abstract class ServerLevelMixin {
 
-    /**
-     * Fires {@link ServerLevelTickStartEvent} at the start of each
-     * {@code ServerLevel.tick(BooleanSupplier)} call.
-     */
+    /** Marker method for the generated tick-start event injection. */
     @Unique
     @InjectEvent(
             method = "tick",
@@ -23,6 +20,5 @@ public abstract class ServerLevelMixin {
             event = ServerLevelTickStartEvent.class
     )
     private void testPlugin$onTick(BooleanSupplier hasTime) {
-        // Marker — the @InjectEvent processor generates the actual injection.
     }
 }

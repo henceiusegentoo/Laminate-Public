@@ -5,10 +5,7 @@ import net.minecraft.server.MinecraftServer;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
 
-/**
- * Injects a {@code write} method into {@link MinecraftServer} to demonstrate
- * the {@link GenerateAccessor} annotation.
- */
+/** Adds a demo accessor method to {@link MinecraftServer}. */
 @Mixin(MinecraftServer.class)
 public final class ServerMixin {
 

@@ -16,10 +16,8 @@ class JvmDescriptorsTest {
         @Test
         @DisplayName("maps void to V")
         void mapsVoidToV() {
-            // Arrange & Act
             final String result = JvmDescriptors.fromClass(void.class);
 
-            // Assert
             assertThat(result).isEqualTo("V");
         }
 
@@ -39,50 +37,40 @@ class JvmDescriptorsTest {
         @Test
         @DisplayName("maps reference type to L-descriptor")
         void mapsReferenceType() {
-            // Arrange & Act
             final String result = JvmDescriptors.fromClass(String.class);
 
-            // Assert
             assertThat(result).isEqualTo("Ljava/lang/String;");
         }
 
         @Test
         @DisplayName("maps nested class with internal name separator")
         void mapsNestedClass() {
-            // Arrange & Act
             final String result = JvmDescriptors.fromClass(java.util.Map.Entry.class);
 
-            // Assert
             assertThat(result).isEqualTo("Ljava/util/Map$Entry;");
         }
 
         @Test
         @DisplayName("maps primitive array to [descriptor")
         void mapsPrimitiveArray() {
-            // Arrange & Act
             final String result = JvmDescriptors.fromClass(int[].class);
 
-            // Assert
             assertThat(result).isEqualTo("[I");
         }
 
         @Test
         @DisplayName("maps reference array to [L-descriptor")
         void mapsReferenceArray() {
-            // Arrange & Act
             final String result = JvmDescriptors.fromClass(String[].class);
 
-            // Assert
             assertThat(result).isEqualTo("[Ljava/lang/String;");
         }
 
         @Test
         @DisplayName("maps multi-dimensional array")
         void mapsMultiDimensionalArray() {
-            // Arrange & Act
             final String result = JvmDescriptors.fromClass(int[][].class);
 
-            // Assert
             assertThat(result).isEqualTo("[[I");
         }
     }

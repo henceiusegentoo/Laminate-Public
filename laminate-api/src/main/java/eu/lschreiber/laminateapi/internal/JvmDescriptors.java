@@ -6,36 +6,13 @@ import javax.lang.model.type.ArrayType;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeMirror;
 
-/**
- * Converts Java types to their JVM type descriptor strings.
- *
- * <p>This utility supports both runtime {@link Class} objects (used when
- * annotation values are directly accessible) and compile-time
- * {@link TypeMirror} objects (used when the annotation processor catches
- * {@link javax.lang.model.type.MirroredTypeException}).</p>
- *
- * <p>Examples of JVM descriptors:</p>
- * <ul>
- *   <li>{@code void} → {@code "V"}</li>
- *   <li>{@code int} → {@code "I"}</li>
- *   <li>{@code String} → {@code "Ljava/lang/String;"}</li>
- *   <li>{@code int[]} → {@code "[I"}</li>
- * </ul>
- *
- * <p>This class is internal to {@code laminate-api} and not part of the
- * public API.</p>
- */
+/** Converts Java types to JVM descriptors. */
 public final class JvmDescriptors {
 
     private JvmDescriptors() {
     }
 
-    /**
-     * Converts a runtime {@link Class} to its JVM type descriptor.
-     *
-     * @param type the class to convert (must not be {@code null})
-     * @return the JVM descriptor string
-     */
+    /** Converts a runtime {@link Class} to a JVM descriptor. */
     public static String fromClass(final Class<?> type) {
         if (type == void.class)    return "V";
         if (type == boolean.class) return "Z";
@@ -52,13 +29,7 @@ public final class JvmDescriptors {
         return "L" + type.getName().replace('.', '/') + ";";
     }
 
-    /**
-     * Converts a compile-time {@link TypeMirror} to its JVM type descriptor.
-     *
-     * @param mirror the type mirror to convert (must not be {@code null})
-     * @return the JVM descriptor string
-     * @throws IllegalArgumentException if the type kind is unsupported
-     */
+    /** Converts a compile-time {@link TypeMirror} to a JVM descriptor. */
     public static String fromTypeMirror(final TypeMirror mirror) {
         return switch (mirror.getKind()) {
             case VOID    -> "V";
@@ -80,12 +51,6 @@ public final class JvmDescriptors {
         };
     }
 
-    /**
-     * Derives the JVM binary name for a {@link TypeElement}, correctly using
-     * {@code $} as the separator for nested/inner classes.
-     *
-     * <p>Example: {@code Map.Entry} → {@code "java.util.Map$Entry"}.</p>
-     */
     private static String binaryName(final TypeElement element) {
         if (element.getEnclosingElement() instanceof final TypeElement enclosing) {
             return binaryName(enclosing) + "$" + element.getSimpleName();

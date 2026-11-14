@@ -1,0 +1,281 @@
+// ============================================================
+[[test-plugin]]
+== 10. Walkthrough: `test-plugin`
+// ============================================================
+
+`test-plugin` is the project's reference hybrid plugin: a small, self-contained
+Bukkit plugin that exercises every piece of the `laminate-api` pipeline
+described in <<laminate-api,chapter 9>>, built as an ordinary *third-party*
+plugin rather than as one of the project's own always-on core mixins
+(`laminate-core-mixins`). It proves the whole pipeline end to end — mixin
+injection into vanilla/Paper classes, a plugin-defined Bukkit event fired from
+injected mixin code via `LaminateEventBridge`, and a `@GenerateAccessor`
+call-through — without requiring any special-casing in the launcher or server
+modules.
+
+Source: `test-plugin/src/main/java/eu/lschreiber/testplugin/`.
+
+=== 10.1. `plugin.yml` — the hybrid plugin descriptor
+
+[source,yaml]
+----
+name: test-plugin
+version: '$version'
+
+main: eu.lschreiber.testplugin.TestPlugin
+api-version: '1.21'
+load: POSTWORLD
+
+authors: [ leander ]
+
+hybrid: true
+mixins:
+  - mixins.testplugin.json
+  - mixins.testplugin.generated.json
+----
+
+`hybrid: true` and the `mixins` list are the Laminate-specific additions on top
+of an otherwise ordinary `plugin.yml`. `mixins.testplugin.json` is the
+hand-written Mixin config (`test-plugin/src/main/resources/mixins.testplugin.json`):
+
+[source,json]
+----
+{
+  "required": true,
+  "package": "eu.lschreiber.testplugin.mixins",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "ServerMixin",
+    "ServerLevelMixin"
+  ]
+}
+----
+
+`mixins.testplugin.generated.json` is produced automatically by
+`InjectEventProcessor` (<<inject-event,9.5.5>>) during compilation and lists
+only the generated companion class, e.g. `ServerLevelInjectEvent_testPlugin_onTick`
+— it must never be hand-edited. `$version` is expanded by the module's own
+`processResources` task (see <<test-plugin-build,10.5>>) from the Gradle
+project version.
+
+=== 10.2. `@GenerateAccessor` demo — `ServerMixin`
+
+[source,java]
+----
+@Mixin(MinecraftServer.class)
+public final class ServerMixin {
+
+    @GenerateAccessor(name = "write")
+    @Unique
+    public void testPlugin$write(final String msg) {
+        System.out.println("[test-plugin] write() injected via mixin: " + msg);
+    }
+}
+----
+
+This mixin injects a brand-new method, `testPlugin$write(String)`, directly
+into `net.minecraft.server.MinecraftServer`. `@Unique` tells SpongePowered
+Mixin the method is wholly new (not an override of anything already on
+`MinecraftServer`) and must not collide with any other mixin's injected
+members; the `testPlugin$` prefix is this plugin's chosen convention for
+keeping its injected member names unambiguous if other hybrid plugins also
+target `MinecraftServer`.
+
+`@GenerateAccessor(name = "write")` causes `GenerateAccessorProcessor` to emit
+`eu.lschreiber.testplugin.accessor.MinecraftServerAccessor`, with a single
+interface method `void write(String p0)` and a static `of(Object)` factory —
+see <<generate-accessor,9.3.5>> for the full generated source.
+
+=== 10.3. `@InjectEvent` demo — `ServerLevelMixin`, the event class, and the listener
+
+`ServerLevelMixin` declares only a *marker* method:
+
+[source,java]
+----
+@Mixin(ServerLevel.class)
+public abstract class ServerLevelMixin {
+
+    @Unique
+    @InjectEvent(
+            method = "tick",
+            at = At.HEAD,
+            event = ServerLevelTickStartEvent.class
+    )
+    private void testPlugin$onTick(BooleanSupplier hasTime) {
+        // Marker — the @InjectEvent processor generates the actual injection.
+    }
+}
+----
+
+The marker method's body is never executed at run time; `InjectEventProcessor`
+reads the annotation and the method's parameter list, and generates a wholly
+separate companion Mixin class (`ServerLevelInjectEvent_testPlugin_onTick`,
+shown in full in <<inject-event,9.5.6>>) that actually performs the
+`@Inject(method = "tick", at = @At("HEAD"))` injection into `ServerLevel` and
+calls `LaminateEventBridge.fire(...)`.
+
+The event class it fires is a completely ordinary Bukkit event — nothing about
+it is Laminate-specific, other than the constructor-signature convention
+`LaminateEventBridge` relies on (target instance first, then the marker
+method's own parameters in order):
+
+[source,java]
+----
+public final class ServerLevelTickStartEvent extends Event {
+
+    private final ServerLevel handle;
+    private final BooleanSupplier hasTime;
+
+    public ServerLevelTickStartEvent(@NotNull ServerLevel handle,
+                                     @NotNull BooleanSupplier hasTime) {
+        this.handle = handle;
+        this.hasTime = hasTime;
+    }
+
+    @NotNull
+    public ServerLevel getHandle() { return this.handle; }
+
+    public boolean hasTime() { return this.hasTime.getAsBoolean(); }
+
+    // getHandlers()/getHandlerList() — standard Bukkit event boilerplate.
+}
+----
+
+And `TickListener` consumes it exactly like any other Bukkit event, with no
+awareness that it originated from injected NMS bytecode on the other side of a
+class-loader boundary:
+
+[source,java]
+----
+public final class TickListener implements Listener {
+
+    @EventHandler
+    public void onServerLevelTickStart(final ServerLevelTickStartEvent event) {
+        if (!event.hasTime()) {
+            return;
+        }
+        final String worldName = event.getHandle().getWorld().getName();
+        final int playerCount = event.getHandle().players().size();
+        LOGGER.info(() -> "[Laminate] @InjectEvent fired — tick start in world="
+                + worldName + ", players=" + playerCount);
+    }
+}
+----
+
+This is the payoff of the class-loader design described in <<event-bridge,9.6>>:
+everything on the plugin-author side of the boundary — the mixin's marker
+method, the event class, the listener — looks and reads like completely
+ordinary Bukkit/Mixin code, with all of the cross-loader reflection concealed
+inside `LaminateEventBridge`.
+
+=== 10.4. Plugin entrypoint — `TestPlugin`
+
+[source,java]
+----
+public final class TestPlugin extends JavaPlugin {
+
+    @Override
+    public void onEnable() {
+        getServer().getPluginManager().registerEvents(new TickListener(), this);
+        registerCommands();
+    }
+
+    private void registerCommands() {
+        final LiteralCommandNode<CommandSourceStack> testCommand = Commands.literal("testcmd")
+                .executes(context -> {
+                    final MinecraftServer server = ((CraftServer) getServer()).getServer();
+                    final MinecraftServerAccessor accessor = MinecraftServerAccessor.of(server);
+                    accessor.write("Hello World");
+                    return 1;
+                })
+                .build();
+
+        getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS,
+                commands -> commands.registrar().register(testCommand));
+    }
+}
+----
+
+`registerCommands()` registers a Brigadier `/testcmd` command that exercises
+the `@GenerateAccessor` path end to end: it unwraps the live `MinecraftServer`
+instance from `CraftServer` (Paper's Bukkit-facing wrapper), wraps it in a
+`MinecraftServerAccessor` via the generated `of(Object)` factory, and calls
+`accessor.write("Hello World")` — which routes through the JDK dynamic proxy,
+the cached `MethodHandle`, and lands on the mixin-injected `testPlugin$write`
+method of the running `MinecraftServer` singleton.
+
+=== 10.5. [[test-plugin-build]]Build setup — compiling against real Paper/NMS internals
+
+`test-plugin/build.gradle.kts` applies `io.papermc.paperweight.userdev` (its
+version is declared once, without a version, at the root — see the note in
+<<build,chapter 11>> about a known paperweight-userdev classloader bug that
+appears when the plugin+version pair is declared independently in more than
+one subproject) and `com.gradleup.shadow`:
+
+[source,kotlin]
+----
+plugins {
+    id("com.gradleup.shadow") version "9.6.0"
+    id("io.papermc.paperweight.userdev")
+}
+
+dependencies {
+    compileOnly("net.fabricmc:sponge-mixin:0.17.3+mixin.0.8.7")
+    compileOnly("io.github.llamalad7:mixinextras-common:0.5.4")
+    annotationProcessor("io.github.llamalad7:mixinextras-common:0.5.4")
+
+    compileOnly(project(":laminate-api"))
+    annotationProcessor(project(":laminate-api"))
+
+    paperweight.paperDevBundle(providers.gradleProperty("paperDevBundleVersion").get())
+}
+
+tasks.build {
+    dependsOn(tasks.shadowJar)
+}
+----
+
+`paperweight.paperDevBundle(...)` pulls in paperweight userdev's Mojang-mapped
+dev bundle for the exact `paperDevBundleVersion` configured in the root
+`gradle.properties` — a separate, developer-supplied property from
+`paperVersion` (<<build,chapter 11>> covers why they're separate) — this is
+what lets `ServerMixin` and `ServerLevelMixin` compile against
+real, Mojang-mapped `MinecraftServer`/`ServerLevel` internals rather than
+against obfuscated names or hand-maintained stub classes. `sponge-mixin` and
+`mixinextras-common` are `compileOnly` (plus `mixinextras-common` also as an
+`annotationProcessor`, since MixinExtras ships its own compile-time
+processing) with coordinates deliberately matching `laminate-runtime`'s and
+`gradle/libs.versions.toml`'s own pins, so the plugin compiles against exactly
+the Mixin/MixinExtras versions the bundled server actually ships at run time —
+and, like `laminate-api` itself, neither is ever shaded into the plugin jar,
+since the server already provides both.
+
+`tasks.build { dependsOn(tasks.shadowJar) }` makes the default `build` task
+produce the fat jar (`test-plugin-<version>-all.jar`) that would actually be
+droppable into a `plugins/` directory, alongside the plain jar Gradle's `java`
+plugin already produces.
+
+=== 10.6. Using `test-plugin` as a smoke test
+
+Because it exercises every Laminate-specific mechanism in one small package,
+`test-plugin` doubles as the project's manual (and eventually automated)
+smoke test for the whole hybrid-plugin pipeline. The basic loop:
+
+. Build the bundled server jar (<<build,chapter 11>>) — `laminate-server-<paperVersion>.jar`.
+. Build `test-plugin` (`./gradlew :test-plugin:build`), producing its shaded jar
+  under `test-plugin/build/libs/`.
+. Drop that jar into a `plugins/` directory next to `laminate-server-<paperVersion>.jar`
+  and start the server normally (`java -jar laminate-server-<paperVersion>.jar`).
+. Confirm `[Laminate] @InjectEvent fired — tick start in world=...` lines
+  appear in the console log shortly after the world finishes loading (proving
+  the `ServerLevel.tick()` injection and the event bridge both work), then run
+  `/testcmd` in-game or from the console and confirm
+  `[test-plugin] write() injected via mixin: Hello World` is logged (proving
+  the accessor/`MethodHandle` path works against the live `MinecraftServer`
+  instance).
+
+Because nothing about this loop is special-cased — `test-plugin` is loaded
+exactly the way any third-party hybrid plugin would be — a clean run of it is
+good evidence that the annotation processors, the generated Mixin
+configuration wiring, and the runtime class-loader bridge all agree with each
+other on a real, running server, not just in isolated unit tests.
